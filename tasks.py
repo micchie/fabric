@@ -33,6 +33,7 @@ from hostenv import hostenv
 import re
 import os
 import time
+from patchwork.transfers import rsync
 
 def is_freebsd(c):
     return c.ostype == 'FreeBSD'
@@ -47,12 +48,13 @@ def ensure_connected(c, host):
     return c
 
 def rsync_upload(c, src, dst, nogit=False, delete=False):
-    # avoid rsync_project that uses env.host rather than host_string
     src = src.rstrip('/') + '/'
-    delete_opt = '--delete' if delete else ''
-    excl_opt = '--exclude=\'.git\'' if nogit else ''
-    c.local("rsync -azl %s %s %s %s:%s" % \
-            (delete_opt, excl_opt, src, c.original_host, dst))
+    exclude = '.git' if nogit else ''
+    ssh_agent = os.environ.get('SSH_AUTH_SOCK', None)
+    if ssh_agent:
+        c.config['run']['env']['SSH_AUTH_SOCK'] = ssh_agent
+    rsync(c, src, dst, delete=delete, exclude=exclude, rsync_opts='-q')
+
 
 def norm(s):
     s = re.sub("^\s+", "", s)
@@ -79,10 +81,30 @@ def _hostenv(c, output=False):
     return c
 
 @task
+def rsynctest(c, host, src, dst):
+    c = Connection(host)
+    c = hostenv(c)
+    ssh_agent = os.environ.get('SSH_AUTH_SOCK', None)
+    if ssh_agent:
+        c.config['run']['env']['SSH_AUTH_SOCK'] = ssh_agent
+    rsync(c, src, dst)
+
+@task
 def test(c, host):
     c = Connection(host)
-    c = hostenv(host, c)
-    c.run('ls')
+    print('c', c)
+    c = hostenv(c)
+    with c.cd(c.linux_src):
+        print('freeing up some space')
+        lines = c.run('find . | grep "\.ko$"').stdout
+        lines = lines.replace('\n', ' ')
+        print('lines', lines)
+        #for l in lines.split('\n'):
+        #    if len(l): c.run('echo {}'.format(l.strip('\n')), echo=True)
+    #c.run('ls')
+    #c.local('ls')
+    #s = c.run('uname -r', hide=True)
+    #print(s.stdout.split('-')[0])
 
 @task
 def test2(c, host):
@@ -97,39 +119,39 @@ def _exists(c, s):
     return files.exists(c, s)
 
 @task
+def noht(c, host=None):
+    c = ensure_connected(c, host)
+    c.sudo('bash -c "echo off > /sys/devices/system/cpu/smt/control"',warn=True,
+            echo=True)
+    time.sleep(1)
+
+@task
 def setup_irq(c, host=None):
     c = ensure_connected(c, host)
 
-    for i in range(0, len(c.ifs)):
-
-        # obtain irq list
-        r = c.run('cat /proc/interrupts | grep {} | grep TxRx'.format(c.ifs[i]),
-                warn=True).stdout
-        l = r.split()
-        last = 1
-        for e in l:
-            if re.search('{}-TxRx-0'.format(c.ifs[i]), e):
-                break
-            last += 1
-        else:
+    nomq = False
+    for i in c.ifs:
+        s = 'cat /proc/interrupts | grep "{}-TxRx" | tr -s " " | sed "s/^ //"'
+        r = c.run(s.format(i), hide='stdout', echo=True, warn=True)
+        if not r.stdout:
+            nomq = True
+            r = c.run(s.replace('-TxRx', '').format(i), echo=True, warn=True)
+        if r.failed:
             continue
-        irqs = [l[j:j+last] for j in range(0, len(l), last)]
-
-        # set irqs to intended cores 
-        cpuid = 0
-        for s in irqs:
-            path = '/proc/irq/{}/smp_affinity'.format(s[0].rstrip(':'))
-            cmd = 'echo {:x} >> {}'.format(1 << cpuid, path)
-            c.sudo(cmd)
-            cpuid += 1
+        lines = r.stdout.split('\n')[:-1]
+        for l in lines:
+            irq = l.split(':')[0]
+            cor = 0 if nomq else int(l.split('-')[-1])
+            p = '/proc/irq/{}/smp_affinity'.format(irq)
+            c.sudo('bash -c "echo {:x} >> {}"'.format(1 << cor, p), echo=True)
 
 def do_ifcmd(c, cmd, ifname):
-    n = ifname
+    n = (ifname, c.ncpus) # second argument is only for mq profile
     if is_freebsd(c) and re.search('sysctl', cmd):
         ift = re.split('[0-9]', ifname)[0]
         ifi = ifname[len(ift):len(ifname)]
-        n = '{}.{}'.format(ift, ifi)
-    c.sudo(cmd % n, warn=True)
+        n = ('{}.{}'.format(ift, ifi), '{}'.format(c.ncpus))
+    c.sudo(cmd.format(*n), warn=True, echo=True)
 
 @task
 def setup_ifs(c, host=None, ifs=None, profiles=[]):
@@ -139,7 +161,9 @@ def setup_ifs(c, host=None, ifs=None, profiles=[]):
         ifs = c.ifs
     if not profiles:
         profiles = c.nic_profiles
-        
+    print('Ensuring no HT enabled')
+    noht(c, host)
+
     # configure interfaces
     for i in ifs:
         for p in profiles:
@@ -184,6 +208,7 @@ def unload_netmap(c):
     else:
         print('netmap is not loaded')
         return
+    print('unload_netmap: netmap_modules ', netmap_modules)
 
     for m in netmap_modules:
         c.sudo('rmmod ' + m, warn=True)
@@ -204,21 +229,21 @@ def load_netmap(c, host=None):
         return
     unload_netmap(c)
 
-    c.sudo('insmod ' + '{}/netmap.ko'.format(c.netmap_src))
-    c.sudo('lsmod', hide='both')
+    c.sudo('insmod ' + '{}/netmap.ko'.format(c.netmap_src), echo=True)
+    c.sudo('lsmod')
     if 'nm_premod' in c:
         for m in c.nm_premod:
-            c.sudo('modprobe ' + m, hide='both')
+            c.sudo('modprobe ' + m)
     time.sleep(1)
     for m in c.nm_modules:
-        if c.run('lsmod | grep ^' + m, warn=True).exited == 0:
+        if c.run('lsmod | grep ^' + m, warn=True, hide='both').exited == 0:
             c.sudo('rmmod ' + m, warn=True) # XXX e1000e against e1000
             #sudo('modprobe -r ' + m, warn_only=True) # XXX e1000e against e1000
             c.sudo('lsmod')
         for k in '%s/%s.ko'%(m,m), '%s.ko'%m:
             k = os.path.join(c.netmap_src, k)
             if _exists(c, k):
-                r = c.sudo('insmod ' + k, warn=True)
+                r = c.sudo('insmod ' + k, warn=True, echo=True)
                 if r.exited != 0:
                     r = c.sudo('modprobe ' + k)
                 break
@@ -227,17 +252,32 @@ def load_netmap(c, host=None):
 #        for v, k in ((32, 'if_num'), (64, 'ring_num'), (32784, 'buf_num'), (36864, 'ring_size')):
     for v, k in ((c.priv_if_num, 'if_num'), (c.priv_ring_num, 'ring_num'),
             (c.priv_buf_num, 'buf_num'), (c.priv_ring_size, 'ring_size')):
-        c.sudo('bash -c "echo %d > /sys/module/netmap/parameters/priv_%s"'%(v, k))
+        c.sudo('bash -c "echo %d >> /sys/module/netmap/parameters/priv_%s"'%(v,
+            k), echo=True)
     #sudo('echo %d > /sys/module/netmap/parameters/debug'%65536)
     setup_ifs(c, c.ifs, profiles=c.nic_profiles)
+    print('done load_netmap')
 
-def _make_netmap_linux(c, path, config, drivupload=False):
+def _make_netmap_linux(c, path, config, apps=False ,drivupload=False):
+    # let's get kernel source path
+    if not c.linux_src:
+        v = c.run('uname -r', hide=True).stdout.split('-')[0]
+        c.linux_src = '/usr/src/linux-source-' + v + '/linux-source-' + v
+        print('guess Linux source is at ', c.linux_src)
     with c.cd(path):
         if not not config:
             if drivupload:
                 put('i*.tar.gz', 'LINUX/ext-drivers/')
             cmd = './configure --disable-ptnetmap --disable-generic' + \
-                  ' --enable-extmem --enable-vale --enable-stack --no-apps'
+                  ' --enable-extmem --enable-vale --enable-stack'
+            if apps:
+                cmd += ' --apps={}'.format(apps)
+            else:
+                cmd += ' --no-apps'
+            if 'nm_driver_suffix' in c:
+                cmd += ' --driver-suffix=-netmap'
+            if c.linux_src:
+                cmd += ' --kernel-dir={}'.format(c.linux_src)
             if config == 'nodriv':
                 cmd += ' --no-drivers'
             else:
@@ -250,15 +290,11 @@ def _make_netmap_linux(c, path, config, drivupload=False):
             c.run(cmd)
         #run('make -j%d KSRC=%s' % (env.ncpus+1, env.linux_src))
         cmd = 'make'
-        if c.linux_src:
-            cmd += ' KSRC=%s' % c.linux_src
         c.run(cmd)
 
 @task
-def make_netmap_apps(c=None, src=None):
-    if c is None:
-        c = Connection(host)
-        _hostenv(c)
+def make_netmap_apps(c, host=None, src=None):
+    c = ensure_connected(c, host)
     makecmd = 'gmake' if is_freebsd(c) else 'make'
     appdir = os.path.join(c.netmap_src, 'apps')
     cmd = '{} apps'.format(makecmd)
@@ -267,12 +303,18 @@ def make_netmap_apps(c=None, src=None):
         rsync_upload(c, os.path.join(src, os.path.basename(appdir)), appdir,
                 nogit=c.nogit)
     with c.cd(c.netmap_src):
+        print(cmd)
         c.run(cleancmd)
         c.run(cmd)
+    phttpd = os.path.join(appdir, 'phttpd')
+    print('phttpd', phttpd, _exists(c, phttpd))
+    if _exists(c, phttpd):
+        with c.cd(phttpd):
+            c.run('make clean; make')
 
 @task
 def make_netmap(c, host, src=None, config=False, fbsddriv=False,
-        drivupload=False, debug=False):
+        drivupload=False, debug=False, noload=False, apps=''):
     c = ensure_connected(c, host)
 
     if src:
@@ -294,14 +336,15 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
     #tweak_netmap(env.netmap_src)
     libnetmappath = os.path.join(c.netmap_src, 'libnetmap')
     if is_linux(c):
-        _make_netmap_linux(c, c.netmap_src, config, drivupload)
+        _make_netmap_linux(c, c.netmap_src, config, apps, drivupload)
         if _exists(c, libnetmappath):
             with c.cd(libnetmappath):
                 #run('gcc -c nmreq.c -I../sys -DLIB')
                 #run('ar rcs libnetmap.a nmreq.o')
                 c.run('make')
-        make_netmap_apps(c)
-        load_netmap(c)
+        make_netmap_apps(c, src=src)
+        if not noload:
+            load_netmap(c)
 
     elif is_freebsd(c):
         with cd(env.netmap_src):
@@ -325,36 +368,75 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
                     run('clang -c nmreq.c -I../sys -DLIB')
                     run('ar rcs libnetmap.a nmreq.o')
         make_netmap_apps()
-    print('done')
+    print('done make_netmap')
 
 @task
-def make_linux(c, host, src, noupload=False, config=False):
+def make_linux(c, host, src, noupload=False, config=False,
+        debug=False, trace=False, opt=False, pmem=False, nospace=False):
     c = Connection(host)
     _hostenv(c)
     if not noupload:
         rsync_upload(c, src, c.linux_src, nogit=c.nogit, delete=(not not config))
-    with c.cd(c.linux_src):
-        if config:
+    if config:
+        with c.cd(c.linux_src):
             c.run("make mrproper")
-            config_linux(c)
+        config_linux(c, debug, trace, opt, (not ('nopmem' in c)))
+    with c.cd(c.linux_src):
         c.run("make -j%d bzImage" % (c.ncpus+1))
         c.run("make -j%d modules" % (c.ncpus+1))
+        if nospace:
+            print('freeing up some space')
+            l = c.run('find . | grep "\.o$"').stdout.split('\n')
+            batches = [l[i:i+20] for i in range(0, len(l), 20)]
+            for b in batches:
+                c.run('rm {}'.format(' '.join(b)), echo=True)
+    print('installing the new kernel to {}'.format(c.linux_src))
     c.sudo('bash -c "cd {} && make modules_install"'.format(c.linux_src))
     c.sudo('bash -c "cd {} && make install"'.format(c.linux_src))
+
+def update_kconfig(c, d, conffile):
+    for k, v in d.items():
+        kk = 'CONFIG_' + k
+        # match against uncommented and commented lines
+        for confline in kk + '=', '# ' + kk + ' ':
+            if open(conffile).read().find(confline) != -1:
+                if v == 'n':
+                    if confline[0] != '#':
+                        c.local('sed -i -e "s/{}/{}/" {}'.format(
+                            confline + '.*$', '# ' + kk + ' is not set',
+                            conffile))
+                    # otherwise already commented out
+                else:
+                    if '"' in v:
+                        v = v.replace('"', '\\"')
+                    c.local('sed -i -e "s/{}/{}/" {}'.format( confline +
+                        '.*$', kk + '=' + v, conffile))
+                break
+        else:
+            if v != 'n':
+                open(conffile, 'a').write(kk + '=' + v + '\n')
 
 #
 # config must be def, cur or old
 #
-def config_linux(c, perf=True, sym=True, debug=False, stap=False):
+def config_linux(c, debug, trace, opt, pmem):
 
     base = c.linux_config
-    if base == 'cur':
-        c.run('cp /boot/config-`uname -r` .config')
-        c.run('make olddefconfig')
-    elif base == 'def':
-        c.run("make defconfig")
+    with c.cd(c.linux_src):
+        if base == 'cur':
+            c.run('cp /boot/config-`uname -r` .config')
+            c.run('yes "" | make olddefconfig')
+        elif base == 'def':
+            c.run("make defconfig")
 
     #ver = kernelversion()
+    if opt:
+        if debug:
+            print('debug cannot coexist with opt')
+            debug = False
+        if trace:
+            print('trace cannot coexist with opt')
+            trace = False
 
     d = {}
 
@@ -362,46 +444,46 @@ def config_linux(c, perf=True, sym=True, debug=False, stap=False):
     d.update({'LOCALVERSION':'"-fab"'})
 
     # y for systemtap, otherwise n
-    if stap:
-        stp_config = ['RELAY', 'DEBUG_FS', 'DEBUG_INFO', 'KPROBES',
-            'DEBUG_INFO_DWARF4', 'ENABLE_MUST_CHECK', 'FRAME_POINTER',
-            'DEBUG_KERNEL']
-        d.update({k:'y' for k in stp_config})
-
-    # perf
-    if perf:
-        d.update({'KPROBE_EVENTS':'y'})
+    if trace:
+        trace_config = ['RELAY', 'DEBUG_FS', 'DEBUG_INFO', 'KPROBES',
+                        'KPROBE_EVENTS',
+                        'DEBUG_INFO_DWARF4', 'ENABLE_MUST_CHECK',
+                        'FRAME_POINTER', 'DEBUG_KERNEL', 'KALLSYMS_ALL',
+                        'BPF_SYSCALL', 'BPF_EVENTS', 'BPF_JIT_ALWAYS_ON']
+        d.update({k:'y' for k in trace_config})
+        d.update({'DEBUG_INFO_REDUCED':'n'})
 
     # General kernel debug (disable if unnecessary)
     if debug:
         dbg_config = ['UNINLINE_SPIN_UNLOCK', 'PREEMPT_COUNT', 'DEBUG_SPINLOCK',
-            'DEBUG_MUTEXES', 'DEBUG_LOCK_ALLOC', 'DEBUG_LOCKDEP', 'LOCKDEP',
-            'DEBUG_ATOMIC_SLEEP', 'TRACE_IRQFLAGS', 'PROVE_RCU']
+                      'DEBUG_MUTEXES', 'DEBUG_LOCK_ALLOC', 'DEBUG_LOCKDEP',
+                      'LOCKDEP', 'DEBUG_ATOMIC_SLEEP', 'TRACE_IRQFLAGS',
+                      'PROVE_RCU']
         d.update({k:'y' for k in dbg_config})
 
-    # Kernel symbol
-    if sym:
-        d.update({'KALLSYMS_ALL':'y'})
-
-    # virtio - based on http://www.linux-kvm.org/page/Virtio
-    virtio_config = {'VIRTIO_PCI', 'VIRTIO_BALLOON', 'VIRTIO_BLK',
-            'VIRTIO', 'VIRTIO_RING', 'VIRTIO_NET'}
+    ## virtio - based on http://www.linux-kvm.org/page/Virtio
+    virtio_config = {'VIRTIO_MENU', 'VIRTIO_PCI', 'VIRTIO_PCI_LEGACY',
+                     'VIRTIO_BALLOON', 'VIRTIO_BLK', 'VIRT_DRIVERS',
+                     'VIRTIO_CMDLINE_DEVICES'}
     d.update({k:'y' for k in virtio_config})
-    d.update({'VIRTIO_NET':'m'})
+
+    virtio_config = ['VIRTIO', 'VIRTIO_NET', 'VIRTIO_INPUT', 'VIRTIO_MMIO',
+                     'VBOXGUEST', 'VIRTIO_CONSOLE', 'VIRTIO_BLK']
+    d.update({k:'m' for k in virtio_config})
 
     # netmap drivers
     nic_config = {'E1000':'m', 'E1000E':'y', 'IGB':'m', 'IGB_HWMON':'y',
-            'IGB_DCA':'y', 'IGBVF':'m', 'IXGBE':'m', 'IXGBE_HWMON':'y',
-            'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'y', 'IXGBEVF':'m',
-            'I40E':'m', 'I40EVF':'m', 'VETH':'m', 'INFINIBAND':'n'}
+                  'IGB_DCA':'y', 'IGBVF':'m', 'IXGBE':'m', 'IXGBE_HWMON':'y',
+                  'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'y', 'IXGBEVF':'m',
+                  'I40E':'m', 'I40EVF':'m', 'VETH':'m', 'INFINIBAND':'n'}
     d.update(nic_config)
 
     # mellanox
     mlx_config = {'NET_VENDOR_MELLANOX':'y', 'MLX4_EN':'m', 'MLX4_CORE':'m',
-            'MLX4_DEBUG':'y', 'MLX4_CORE_GEN2':'y', 'MLX5_CORE':'m',
-            'MLX5_CORE_EN':'y', 'MLX5_EN_ARFS':'y', 'MLX5_EN_RXNFC':'y',
-            'MLX5_MPFS':'y', 'MLX4_ESWITCH':'y', 'MLX5_CORE_IPOIB':'y',
-            'MLX5_SW_STEERING':'y'}
+                  'MLX4_DEBUG':'y', 'MLX4_CORE_GEN2':'y', 'MLX5_CORE':'m',
+                  'MLX5_CORE_EN':'y', 'MLX5_EN_ARFS':'y', 'MLX5_EN_RXNFC':'y',
+                  'MLX5_MPFS':'y', 'MLX4_ESWITCH':'y', 'MLX5_CORE_IPOIB':'y',
+                  'MLX5_SW_STEERING':'y'}
     d.update(mlx_config)
 
     # netmap after 4.17
@@ -409,85 +491,93 @@ def config_linux(c, perf=True, sym=True, debug=False, stap=False):
     d.update(ax25_config)
 
     tun_config = {'NET_IPIP':'m', 'NET_L3_MASTER_DEV':'y', 'BPF_JIT':'y',
-            'NET_SWITCHDEV':'y', 'NET_IPGRE':'m', 'NET_IPGRE_DEMUX':'m',
-            'NET_IPGRE_BROADCAST':'y', 'NET_IP_TUNNEL':'y',
-            'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
+                  'NET_SWITCHDEV':'y', 'NET_IPGRE':'m', 'NET_IPGRE_DEMUX':'m',
+                  'NET_IPGRE_BROADCAST':'y', 'NET_IP_TUNNEL':'y',
+                  'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
     d.update(tun_config)
 
-    noconfigs = ['SWAP', 'SOUND', 'AUDIT', 'NET_VENDOR_3COM',
-            'NET_VENDOR_ADAPTEC', 'NET_VENDOR_AGERE', 'NET_VENDOR_ALTEON',
-            'ALTERA_TSE', 'NET_VENDOR_AMD', 'NET_XGENE', 'EDAC', 'SECURITY',
-            'NET_VENDOR_ARC', 'NET_VENDOR_ATHEROS', 'NET_VENDOR_CISCO',
-            'NET_VENDOR_DEC', 'DNET', 'CX_ECAT', 'NET_VENDOR_DLINK',
-            'NET_VENDOR_FUJITSU', 'NET_VENDOR_MICREL', 'NET_VENDOR_NATSEMI',
-            'NET_VENDOR_NVIDIA', 'NET_VENDOR_OKI', 'NET_VENDOR_QUALCOMM',
-            'NET_VENDOR_RDC', 'NET_VENDOR_SAMSUNG', 'NET_VENDOR_SEEQ',
-            'NET_VENDOR_SILAN', 'NET_VENDOR_SIS', 'NET_VENDOR_SMSC',
-            'NET_VENDOR_STMICRO', 'NET_VENDOR_SUN', 'NET_VENDOR_TEHUTI',
-            'NET_VENDOR_TI', 'NET_VENDOR_VIA', 'NET_VENDOR_WIZNET',
-            'NET_VENDOR_XIRCOM', 'FDDI', 'HIPPI', 'NET_SB1000',
-            'USB_PRINTER', 'INPUT_TOUCHSCREEN', 'INPUT_TABLET',
-            'INPUT_JOYSTICK', 'USB_NET_DRIVERS', 'WIRELESS',
-            'NET_VENDOR_EMULEX', 'NET_VENDOR_EXAR', 'NET_VENDOR_BROCADE',
-            'NET_VENDOR_HP', 'NET_VENDOR_I825XX', 'NET_VENDOR_MARVELL',
-            'HAMRADIO', 'NET_VENDOR_MYRI', 'RFKILL', 'TASK_XACCT', 'PCCARD',
-            'PCMCIA', 'PCMCIA_LOAD_CIS', 'CARDBUS', 'IRDA', 'DONGLE', 'BT',
-            'WIMAX', 'RFKILL', 'CAIF', 'NFC', 'MEDIA_SUPPORT', 'RC_CORE',
-            'USB_VIDEO_CLASS', 'USB_VIDEO_CLASS_INPUT_EVDEV', 'USB_GSPCA',
-            'DVB_USB', 'VIDEO_EM28XX', 'USB_AIRSPY', 'USB_HACKRF',
-            'USB_MSI2500', 'MEDIA_PCI_SUPPORT', 'VIDEO_MEYE', 'VIDEO_SOLO6X10',
-            'VIDEO_TW68', 'VIDEO_ZORAN', 'VIDEO_IVTV', 'DRM', 
-            'NET_VENDOR_RENESAS', 'NET_VENDOR_QLOGIC', 'MACINTOSH_DRIVERS',
-            'WIRELESS', 'NET_VENDOR_ALACRITECH', 'NET_CADENCE',
-            'NET_VENDOR_EZCHIP', 'WLAN', 'PPS']
+    noconfigs = ['IP_SCTP', 'IP_DCCP', 'SWAP', 'SOUND', 'AUDIT',
+              'NET_VENDOR_3COM', 'E100', 'NET_VENDOR_MICROSEMI',
+              'NET_VENDOR_MICROCHIP', 'NET_VENDOR_MYRI', 'NET_VENDOR_NETERION',
+              'NET_VENDOR_ADAPTEC', 'NET_VENDOR_AGERE', 'NET_VENDOR_ALTEON',
+              'ALTERA_TSE', 'NET_VENDOR_AMD', 'NET_XGENE', 'EDAC', 'SECURITY',
+              'NET_VENDOR_ARC', 'NET_VENDOR_ATHEROS', 'NET_VENDOR_CISCO',
+              'NET_VENDOR_DEC', 'DNET', 'CX_ECAT', 'NET_VENDOR_DLINK',
+              'NET_VENDOR_FUJITSU', 'NET_VENDOR_MICREL', 'NET_VENDOR_NATSEMI',
+              'NET_VENDOR_NVIDIA', 'NET_VENDOR_OKI', 'NET_VENDOR_QUALCOMM',
+              'NET_VENDOR_RDC', 'NET_VENDOR_SAMSUNG', 'NET_VENDOR_SEEQ',
+              'NET_VENDOR_SILAN', 'NET_VENDOR_SIS', 'NET_VENDOR_SMSC',
+              'NET_VENDOR_STMICRO', 'NET_VENDOR_SUN', 'NET_VENDOR_TEHUTI',
+              'NET_VENDOR_TI', 'NET_VENDOR_VIA', 'NET_VENDOR_WIZNET',
+              'NET_VENDOR_XIRCOM', 'FDDI', 'HIPPI', 'NET_SB1000',
+              'USB_PRINTER', 'INPUT_TOUCHSCREEN', 'INPUT_TABLET',
+              'INPUT_JOYSTICK', 'USB_NET_DRIVERS', 'WIRELESS',
+              'NET_VENDOR_EMULEX', 'NET_VENDOR_EXAR', 'NET_VENDOR_BROCADE',
+              'NET_VENDOR_HP', 'NET_VENDOR_I825XX', 'NET_VENDOR_MARVELL',
+              'HAMRADIO', 'NET_VENDOR_MYRI', 'RFKILL', 'TASK_XACCT', 'PCCARD',
+              'PCMCIA', 'PCMCIA_LOAD_CIS', 'CARDBUS', 'IRDA', 'DONGLE', 'BT',
+              'WIMAX', 'RFKILL', 'CAIF', 'NFC', 'MEDIA_SUPPORT', 'RC_CORE',
+              'USB_VIDEO_CLASS', 'USB_VIDEO_CLASS_INPUT_EVDEV', 'USB_GSPCA',
+              'DVB_USB', 'VIDEO_EM28XX', 'USB_AIRSPY', 'USB_HACKRF',
+              'USB_MSI2500', 'MEDIA_PCI_SUPPORT', 'VIDEO_MEYE', 'VIDEO_SOLO6X10',
+              'VIDEO_TW68', 'VIDEO_ZORAN', 'VIDEO_IVTV',
+              'NET_VENDOR_RENESAS', 'NET_VENDOR_QLOGIC', 'MACINTOSH_DRIVERS',
+              'NET_VENDOR_ALACRITECH', 'NET_CADENCE',
+              'NET_VENDOR_EZCHIP', 'WLAN', 'PPS', 'LEDS_TRIGGERS',
+              'EEPC_LAPTOP', 'SYSTEM_TRUSTED_KEYRING', 'SYSTEM_TRUSTED_KEYS',
+              'STAGING', 'DRM_XEN', 'SLIP', 'VMXNET3',
+              'NET_VENDOR_CHELSIO', 'NET_VENDOR_AQUANTIA',
+              'CAN', 'WAN', 'SCSI_QLOGIC_1280', 'SCSI_QLA_FC', 'SCSI_QLA2XXX',
+              'SCSI_QLA_ISCSI', 'SCSI_LPFC', 'SCSI_BFA_FC', 'ATM', 'ISDN',
+              'IIO', 'USB_GADGET', '6LOWPAN', 'BT', 'BATMAN_ADV', 'TIPC',
+              'DECNET', 'PHONET', 'NET_NCSI', 'ATALK', 'AFS_FS', 'CIFS',
+              'CEPH_FS', 'CEPH_LIB', 'F2FS_FS', 'REISERFS_FS', 'GFS2_FS',
+              'OCFS2_FS', 'BLK_DEV_DRBD', 'FUSION', 'TARGET', 'FIREWIRE',
+              'MACINTOSH_DRIVERS', 'NET_FC', 'YENTA', 'RAPIDIO',
+              'SENSORS_LIS3LV02D', 'AD525X_DPOT', 'IBM_ASM', 'PHANTOM',
+              'TIFM_CORE', 'ICS932S401', 'ENCLOSURE_SERVICES', 'SGI_XP',
+              'APDS9802ALS', 'ISL29003', 'ISL29020', 'SENSORS_TSL2550',
+              'SENSORS_BH1770', 'SENSORS_APDS990X', 'HMC6352', 'DS1682',
+              'VMWARE_BALLOON'
+              ]
     d.update({k:'n' for k in noconfigs})
 
     """
     d.update({'IOMMU_SUPPORT':'n'})
     """
 
+    # Following PMEM/NVMe options seem unnecessary
     # pmem
-    nvm_config = {'EXPERT':'y', 'XFS_FS':'y', 'FS_DAX':'y',
-            'X86_PMEM_LEGACY_DEVICE':'y', 'X86_PMEM_LEGACY':'y',
-            'ACPI_NFIT':'m', 'LIBNVDIMM':'y', 'BLK_DEV_PMEM':'m', 'ND_BLK':'m',
-            'ND_CLAIM':'y', 'ND_BTT':'m', 'BTT':'y', 'ND_PFN':'m',
-            'NVDIMM_PFN':'y', 'ZONE_DMA':'n', 'MEMORY_HOTPLUG':'y',
-            'MEMORY_HOTREMOVE':'y', 'SPARSEMEM_VMEMMAP':'y', 'ZONE_DEVICE':'y',
-            'TRANSPARENT_HUGEPAGE':'y', 'DEV_DAX':'y'}
-    d.update(nvm_config)
+    #nvm_config = {'EXPERT':'y', 'XFS_FS':'y', 'FS_DAX':'y',
+    #        'X86_PMEM_LEGACY_DEVICE':'y', 'X86_PMEM_LEGACY':'y',
+    #        'ACPI_NFIT':'m', 'LIBNVDIMM':'y', 'BLK_DEV_PMEM':'m', 'ND_BLK':'m',
+    #        'ND_CLAIM':'y', 'ND_BTT':'m', 'BTT':'y', 'ND_PFN':'m',
+    #        'NVDIMM_PFN':'y', 'ZONE_DMA':'n', 'MEMORY_HOTPLUG':'y',
+    #        'MEMORY_HOTREMOVE':'y', 'SPARSEMEM_VMEMMAP':'y', 'ZONE_DEVICE':'y',
+    #        'TRANSPARENT_HUGEPAGE':'y', 'DEV_DAX':'y'}
+    #if pmem:
+    #    d.update(nvm_config)
 
     # NVMe
-    nvme_config = {'NVME_CORE':'y', 'BLK_DEV_NVME':'y'}
-    d.update(nvme_config)
-
+    nvme_config = ['NVME_CORE', 'BLK_DEV_NVME', 'NVME_MULTIPATH']
+    d.update({k:'y' for k in nvme_config})
+    nvme_config = ['NVME_FABRICS', 'NVME_RDMA', 'NVME_TCP', 'NVME_TARGEt',
+                   'NVME_TARGET_LOOP', 'NVME_TARGET_RDMA', 'NVME_TARGET_TCP']
+    d.update({k:'m' for k in nvme_config})
 
     # Small optimization
-    opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
-    d.update(opt_config)
+    #opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
+    if opt:
+        opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
+        d.update(opt_config)
 
     conffile = '.config'
-    for k, v in d.items():
-        kk = 'CONFIG_' + k
-        # match against uncommented and commented lines
-        for confline in kk + '=', '# ' + kk + ' ':
-            if files.contains(c, conffile, confline):
-                if v == 'n':
-                    if confline[0] != '#':
-                        c.run('sed -i -e "s/{}/{}/" {}'.format(
-                            confline + '.*$', '# ' + kk + ' is not set',
-                            conffile))
-                    # otherwise already commented out
-                else:
-                    if '"' in v:
-                        v = v.replace('"', '\\"')
-                    c.run('sed -i -e "s/{}/{}/" {}'.format(confline + '.*$', kk
-                         + '=' + v, conffile))
-                break
-        else:
-            if v != 'n':
-                files.append(c, conffile, kk + '=' + v)
-    c.run("make olddefconfig")
-    #run("make defconfig")
+    c.get(os.path.join(c.linux_src, conffile))
+    update_kconfig(c, d, conffile)
+    c.put(conffile, os.path.join(c.linux_src, conffile))
+
+    with c.cd(c.linux_src):
+        c.run("make olddefconfig")
 
 def run_bg(c, cmd, sockname='dtach'):
     return c.run('dtach -n `mktemp -u /tmp/%s.XXXX` %s' % (sockname, cmd))
@@ -516,6 +606,80 @@ def start_dgraph(c, host, mem='2048', nozero=False, noalpha=False,
     if not noratel:
         if not 'dgraphpath' in c:
             run_bg(c, 'dgraph-ratel')
+
+@task
+def config_newfs(c, host, dev, fstype='xfs', newfs=False):
+    c = ensure_connected(c, host)
+
+    mnt = '/mnt/ext'
+    #opt = '-d su=4k,sw=1'
+    opt = ''
+
+    if not _exists(c, dev):
+        print('no device %s'%dev)
+    if not _exists(c, mnt):
+        c.sudo('mkdir ' + mnt)
+    else:
+        r = c.run('mount | grep %s'%mnt, warn=True)
+        #if r.succeeded:
+        c.sudo('umount  ' + mnt, warn=True)
+    if newfs:
+        c.sudo('mkfs.%s %s -f %s'%(fstype, opt, dev), warn=True)
+    c.sudo('mount %s %s'%(dev, mnt), warn=True)
+    if newfs:
+        c.sudo('chmod 777 ' + mnt)
+
+@task
+def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agcount=1):
+    c = ensure_connected(c, host)
+
+    mnt = '/mnt/pmem'
+    dev = '/dev/pmem0'
+    #opt = 'su=1024000k,sw=1'
+    opt = ''
+    if fstype == 'xfs':
+        opt = '-d '
+        if not agcount:
+            opt += 'su=1024m,sw=1'
+        else:
+            #opt = 'agcount=1,su=1024m,sw=1'
+            opt += 'agsize=8192000000'
+        opt += ' -m reflink=0'
+    fsize = int(fsize)
+    bs = 4096
+
+    if not _exists(c, mnt):
+        c.sudo('mkdir ' + mnt)
+    else:
+        r = c.run('mount | grep {}'.format(mnt), warn=True)
+        if not r.failed:
+            c.sudo('umount  ' + mnt, warn=True)
+
+    if fstype == 'xfs':
+        devopt = '-f ' + dev
+    else:
+        devopt = dev
+
+    r = c.sudo('mkfs.{} {} {}'.format(fstype, opt, devopt), warn=True, echo=True)
+    if r.failed:
+        # To allocate 256m region and file, we can use memmap 384M!640M
+        print('try again...')
+        if fstype == 'xfs':
+            opt = '-d '
+            if not agcount:
+                opt += 'su=256m,sw=1'
+            else:
+                opt += 'agsize=1024000000'
+        #opt = 'agsize=256m,su=256m,sw=1'
+        fsize /= 8
+        c.sudo('mkfs.{} {} {}'.format(fstype, opt, devopt), echo=True)
+    c.sudo('mount -o dax {} {}'.format(dev, mnt), echo=True)
+
+#    if fname and fsize and not exists(os.path.join(mnt, fname)):
+#        sudo('fallocate -l %d %s' % (fsize, os.path.join(mnt, fname)))
+#        sudo('dd if=/dev/zero of=%s bs=%d count=%d' %
+#               (os.path.join(mnt, fname), bs, fsize/bs))
+    c.sudo('chmod -R 777 ' + mnt, echo=True)
 
 if __name__ == '__main__':
     test('va1')

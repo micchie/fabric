@@ -12,6 +12,7 @@ def dst_home(user, env):
 #
 b2b = [('192.168.%d.2/24' % (11+i) , '192.168.%d.3/24' % (11+i)) for i in
         range(4)]
+b2b_cl = [('10.10.1.1/24', '10.10.1.2/24')]
 star = [('192.168.20.%d/24'%i) for i in range(2, 10)]
 def_ports = [50000, 60000]
 
@@ -24,7 +25,8 @@ def linux_defaults(env):
         env.workdir = os.path.join(dst_home(env.user, env), 'deployed')
     env.linux_src = os.path.join(env.workdir, 'net-next')
     env.netmap_src = os.path.join(env.workdir, 'netmap')
-    env.nm_modules = ['e1000', 'ixgbe']
+    env.nm_modules = ['e1000', 'ixgbe', 'i40e']
+    env.nm_no_ext_drivers = env.nm_modules
     env.nm_premod = ['mdio']
     env.linux_config = 'def'
     env.ovs_src = os.path.join(env.workdir, 'ovs')
@@ -36,63 +38,37 @@ def linux_defaults(env):
     # May fail, set warn_only
     env.nic_all_profiles = {
         'common': [
-            'ip link set %s up',
-            'ip link set %s promisc on',
-            'ethtool -A %s autoneg off tx off rx off',
+            'ip link set {} up',
+            'ip link set {} promisc on',
+            'ethtool -A {} autoneg off tx off rx off',
         ],
         'offload': [
-            'ethtool -K %s tx on rx on tso on lro on',
-            'ethtool -K %s gso on gro on',
+            'ethtool -K {} tx on rx on tso on lro on',
+            'ethtool -K {} gso on gro on',
         ],
         'onload': [
-            'ethtool -K %s tx off rx off tso off lro off',
-            'ethtool -K %s tx off rx off tso off',
-
-            'ethtool -K %s gso off gro off',
+            'ethtool -K {} tx off rx off tso off',
+            'ethtool -K {} lro off',
+            'ethtool -K {} gso off gro off',
         ],
         'csum': [
-            'ethtool -K %s tx-checksum-ip-generic on',
-            'ethtool -K %s tx-checksum-ipv4 on', # i40e
+            'ethtool -K {} tx-checksum-ip-generic on',
+            'ethtool -K {} tx-checksum-ipv4 on', # i40e
         ],
         'noim': [
-            'ethtool -C %s rx-usecs 0',
-            'ethtool -C %s adaptive-rx off adaptive-tx off rx-usecs 0 tx-usecs 0 rx-usecs-irq 0 tx-usecs-irq 0 rx-frames 0 tx-frames 0',
+            'ethtool -C {} rx-usecs 0 tx-usecs 0',
+            'ethtool -C {} adaptive-rx off adaptive-tx '
+            'off rx-usecs 0 tx-usecs 0'
         ],
         'busywait': [
-            'ethtool -C %s rx-usecs 1022',
-            'ethtool -C %s adaptive-rx off adaptive-tx off rx-usecs 0 tx-usecs 0 rx-frames-irq 1 tx-frames-irq 1',
-            # *-usecs supports up to 8160 for i40e
-            'ethtool -C %s adaptive-rx off adaptive-tx off rx-usecs 1022 tx-usecs 1022 rx-usecs-irq 1022 tx-usecs-irq 1022 rx-frames 10000 tx-frames 10000',
+            'ethtool -C {} rx-usecs 1022',
+            'ethtool -C {} adaptive-rx off adaptive-tx off rx-usecs 1022'
         ],
         'singleq': [
-            'ethtool -L %s combined 1',
+            'ethtool -L {} combined 1',
         ],
-        'mq2': [
-            'ethtool -L %s combined 2',
-        ],
-        'mq3': [
-            'ethtool -L %s combined 3',
-        ],
-        'mq4': [
-            'ethtool -L %s combined 4',
-        ],
-        'mq5': [
-            'ethtool -L %s combined 5',
-        ],
-        'mq6': [
-            'ethtool -L %s combined 6',
-        ],
-        'mq7': [
-            'ethtool -L %s combined 7',
-        ],
-        'mq8': [
-            'ethtool -L %s combined 8',
-        ],
-        'mq9': [
-            'ethtool -L %s combined 9',
-        ],
-        'mq10': [
-            'ethtool -L %s combined 10',
+        'mq': [
+            'ethtool -L {} combined {}',
         ],
     }
 
@@ -105,17 +81,17 @@ def freebsd_defaults():
     env.netmap_src = os.path.join(env.workdir, 'netmap')
     env.nic_all_profiles = {
         'common':[
-            'ifconfig %s up',
+            'ifconfig {} up',
         ],
         'onload':[
-            'ifconfig %s -lro -tso -txcsum -rxcsum',
+            'ifconfig {} -lro -tso -txcsum -rxcsum',
         ],
         'offload':[
-            'ifconfig %s lro tso txcsum rxcsum',
+            'ifconfig {} lro tso txcsum rxcsum',
         ],
         'noim': [
-            'sysctl dev.%s.queue0.interrupt_rate=1',
-            'sysctl dev.%s.rx_itr=1',
+            'sysctl dev.{}.queue0.interrupt_rate=1',
+            'sysctl dev.{}.rx_itr=1',
         ],
     }
     # Merge with linux_defaults() better...
@@ -143,7 +119,7 @@ def hostenv(env):
         env.netmap_src = os.path.join(env.workdir, 'netmap')
         env.freebsd_ifcmd = {
                 'common':[
-                        'ifconfig %s up',
+                        'ifconfig {} up',
                 ]
         }
 
@@ -161,17 +137,17 @@ def hostenv(env):
         env.ovs_src = os.path.join(env.workdir, 'ovs')
         env.nic_profiles = {
             'common':[
-                'ip link set %s up',
-                'ethtool -C %s rx-usecs 1',
-                'ethtool -A %s autoneg off tx off rx off',
+                'ip link set {} up',
+                'ethtool -C {} rx-usecs 1',
+                'ethtool -A {} autoneg off tx off rx off',
             ],
             'offload':[
-                'ethtool -K %s tx on rx on tso on',
-                'ethtool -K %s gso on gro on'
+                'ethtool -K {} tx on rx on tso on',
+                'ethtool -K {} gso on gro on'
             ],
             'onload':[
-                'ethtool -K %s tx off rx off tso off',
-                'ethtool -K %s gso off gro off'
+                'ethtool -K {} tx off rx off tso off',
+                'ethtool -K {} gso off gro off'
             ]
         }
 
@@ -532,24 +508,24 @@ def hostenv(env):
         env.netmap_src = os.path.join(env.workdir, 'netmap')
         env.linux_ifcmd = {
             'common':[
-                'ip link set %s up',
+                'ip link set {} up',
                 # swapped these config with m2
-                #'ethtool -C %s rx-usecs 1000',
-                #'ethtool -L %s combined 1'
-                'ethtool -C %s rx-usecs 0'
+                #'ethtool -C {} rx-usecs 1000',
+                #'ethtool -L {} combined 1'
+                'ethtool -C {} rx-usecs 0'
             ],
             'offload': [
-                'ethtool -A %s autoneg off tx off rx off',
-                'ethtool -K %s tx on rx on tso on lro on',
-                'ethtool -K %s gso on gro on'
+                'ethtool -A {} autoneg off tx off rx off',
+                'ethtool -K {} tx on rx on tso on lro on',
+                'ethtool -K {} gso on gro on'
             ],
             'onload': [
-                'ethtool -A %s autoneg off tx off rx off',
-                'ethtool -K %s tx off rx off tso off lro off',
-                'ethtool -K %s gso on gro off'
+                'ethtool -A {} autoneg off tx off rx off',
+                'ethtool -K {} tx off rx off tso off lro off',
+                'ethtool -K {} gso on gro off'
             ],
             'noim': [
-                'ethtool -C %s rx-usecs 0'
+                'ethtool -C {} rx-usecs 0'
             ]
         }
 
@@ -570,22 +546,22 @@ def hostenv(env):
         env.netmap_src = os.path.join(env.workdir, 'netmap')
         env.linux_ifcmd = {
             'common':[
-                'ip link set %s up',
-                'ethtool -C %s rx-usecs 1000',
-                'ethtool -L %s combined 1'
+                'ip link set {} up',
+                'ethtool -C {} rx-usecs 1000',
+                'ethtool -L {} combined 1'
             ],
             'offload': [
-                'ethtool -A %s autoneg off tx off rx off',
-                'ethtool -K %s tx on rx on tso on lro on',
-                'ethtool -K %s gso on gro on'
+                'ethtool -A {} autoneg off tx off rx off',
+                'ethtool -K {} tx on rx on tso on lro on',
+                'ethtool -K {} gso on gro on'
             ],
             'onload': [
-                'ethtool -A %s autoneg off tx off rx off',
-                'ethtool -K %s tx off rx off tso off lro off',
-                'ethtool -K %s gso off gro off'
+                'ethtool -A {} autoneg off tx off rx off',
+                'ethtool -K {} tx off rx off tso off lro off',
+                'ethtool -K {} gso off gro off'
             ],
             'noim': [
-                'ethtool -C %s rx-usecs 0'
+                'ethtool -C {} rx-usecs 0'
             ]
         }
 
@@ -594,7 +570,7 @@ def hostenv(env):
         env.workdir = os.path.join(dst_home(env.user), 'deployed')
         env.fbsd_src = os.path.join(env.workdir, 'freebsd')
         env.fbsd_config = 'MUCLAB'
-        env.fbsd_target = '/usr/local/muclab/image/%s/freebsd.michio' % env.user
+        env.fbsd_target = '/usr/local/muclab/image/{}/freebsd.michio' % env.user
         env.fbsd_install = getattr(operations, 'run')
         env.fbsd_args_in_makefile = True
 
@@ -620,7 +596,7 @@ def hostenv(env):
         env.netmap_src = os.path.join(env.workdir, 'netmap')
         env.freebsd_ifcmd = {
                 'common':[
-                        'ifconfig %s up',
+                        'ifconfig {} up',
                 ]
         }
 
@@ -652,6 +628,7 @@ def hostenv(env):
 
     elif name == 'va1' or name == 'va2':
         linux_defaults(env)
+        env.linux_config = 'cur'
         env.ifs = ['eth1', 'eth2', 'eth3']
         env.ifs_addr = {'eth1':b2b[0][1], 'eth2':b2b[1][1],
                 'eth3':'192.168.18.4/24'}
@@ -662,12 +639,17 @@ def hostenv(env):
         env.def_sport = def_ports[1]
         env.def_dport = def_ports[0]
         env.nm_modules = ['i40e', 'e1000']
+        #env.nm_no_ext_drivers = env.nm_modules
         env.nm_no_ext_drivers = env.nm_modules
         env.nic_profiles = ['common', 'onload', 'csum']
         #env.nic_profiles = ['common', 'onload']
         env.no_clflush = True;
-        env.priv_ring_num = 16
-        env.priv_buf_num = 32000
+        #env.priv_ring_num = 16
+        #env.priv_buf_num = 32000
+        #env.priv_ring_size = 33024  # accommodate 2048 slots
+        env.priv_if_num = 2
+        env.priv_ring_num = 2
+        env.priv_buf_num = 16
         env.priv_ring_size = 33024  # accommodate 2048 slots
 
     #elif name == 'va2':
@@ -713,17 +695,17 @@ def hostenv(env):
         env.ovs_src = os.path.join(env.workdir, 'ovs')
         env.linux_ifcmd = {
             'common':[
-                'ip link set %s up',
-                'ethtool -C %s rx-usecs 1',
-                'ethtool -A %s autoneg off tx off rx off',
+                'ip link set {} up',
+                'ethtool -C {} rx-usecs 1',
+                'ethtool -A {} autoneg off tx off rx off',
             ],
             'offload':[
-                'ethtool -K %s tx on rx on tso on',
-                'ethtool -K %s gso on gro on'
+                'ethtool -K {} tx on rx on tso on',
+                'ethtool -K {} gso on gro on'
             ],
             'onload':[
-                'ethtool -K %s tx off rx off tso off',
-                'ethtool -K %s gso off gro off'
+                'ethtool -K {} tx off rx off tso off',
+                'ethtool -K {} gso off gro off'
                 ]
             }
         env.dgraph = '/Users/michio/dgraphdata'
@@ -741,18 +723,30 @@ def hostenv(env):
         env.priv_buf_num = 640000
         env.priv_ring_size = 33024  # accommodate 2048 slots
 
-    elif name == 'cln0':
+    elif name == 'cl0' or name == 'cl1' or name == 'cl2':
         env.home = '/users'
-        linux_defaults()
-        #env.linux_src = os.path.join(dst_home(env.user), 'net-next')
-        #env.ifs = ['enp6s0f0']
-        #env.ifs_addr = {env.ifs[0]:'10.10.1.2/24'}
-        #env.nm_modules = ['ixgbe']
+        linux_defaults(env)
+        env.linux_config = 'cur'
+        env.nopmem = True
+        #env.linux_src = ''
+        env.ifs = ['ens1f0']
+        if name == 'cl2' or name == 'cl3':
+            env.ifs = ['enp6s0f0', 'enp6s0f1']
+        env.ifs_addr = {env.ifs[0]:b2b_cl[0][0]}
+        if name == 'cl1':
+            env.ifs_addr = {env.ifs[0]:b2b_cl[0][1]}
+        #env.nm_modules = ['i40e']
+        #if name == 'cl2':
+        #    env.nm_modules = ['ixgbe']
         #env.nm_no_ext_drivers = env.nm_modules
-        #env.nic_profiles = ['common', 'onload', 'csum', 'singleq', 'noim']
-        #env.priv_ring_num = 160
-        #env.priv_buf_num = 640000
-        #env.priv_ring_size = 33024  # accommodate 2048 slots
+        env.nic_profiles = ['common', 'onload', 'csum', 'singleq', 'noim']
+        if name != 'cl0':
+            env.nic_profiles = ['common', 'offload', 'csum', 'mq', 'noim']
+        if name == 'cl0' or name =='cl2':
+            env.priv_if_num = 32
+            env.priv_ring_num = 320
+            env.priv_buf_num = 400000
+            env.priv_ring_size = 33024  # accommodate 2048 slots
 
     else:
         linux_defaults(env)
