@@ -55,6 +55,12 @@ def linux_defaults(env):
             'ethtool -K {} tx-checksum-ip-generic on',
             'ethtool -K {} tx-checksum-ipv4 on', # i40e
         ],
+        'singleq': [
+            'ethtool -L {} combined 1',
+        ],
+        'mq': [
+            'ethtool -L {} combined {}',
+        ],
         'noim': [
             'ethtool -C {} rx-usecs 0 tx-usecs 0',
             'ethtool -C {} adaptive-rx off adaptive-tx '
@@ -63,12 +69,6 @@ def linux_defaults(env):
         'busywait': [
             'ethtool -C {} rx-usecs 1022',
             'ethtool -C {} adaptive-rx off adaptive-tx off rx-usecs 1022'
-        ],
-        'singleq': [
-            'ethtool -L {} combined 1',
-        ],
-        'mq': [
-            'ethtool -L {} combined {}',
         ],
     }
 
@@ -600,6 +600,18 @@ def hostenv(env):
                 ]
         }
 
+    elif name == 'n0':
+        linux_defaults(env)
+        env.linux_config = 'cur'
+        env.ifs = ['ens1f0', 'ens1f1']
+        env.nm_modules = ['i40e']
+        env.nm_no_ext_drivers = env.nm_modules
+        env.nic_profiles = ['common', 'onload', 'csum']
+        env.priv_if_num = 2
+        env.priv_ring_num = 2
+        env.priv_buf_num = 16
+        env.priv_ring_size = 33024  # accommodate 2048 slots
+
     elif name == 'va0':
         env.ifs = ['em0', 'em1', 'em2']
         env.ifs_addr = {'em0':b2b[0][0], 'em1':b2b[1][0], 'em2':'192.168.18.2'}
@@ -626,7 +638,12 @@ def hostenv(env):
         #env.nic_profiles = ['common', 'onload']
         env.no_clflush = True;
 
-    elif name == 'va1' or name == 'va2':
+    elif name == 'va5':
+        linux_defaults(env)
+        env.linux_config = 'cur'
+        env.linux_src = os.path.join(dst_home(env.user, env), 'net-next')
+
+    elif name == 'va1':
         linux_defaults(env)
         env.linux_config = 'cur'
         env.ifs = ['eth1', 'eth2', 'eth3']
@@ -638,7 +655,7 @@ def hostenv(env):
         #                        'eth2':'00:00:27:ef:1c:e2'}
         env.def_sport = def_ports[1]
         env.def_dport = def_ports[0]
-        env.nm_modules = ['i40e', 'e1000']
+        env.nm_modules = ['virtio_net.c']
         #env.nm_no_ext_drivers = env.nm_modules
         env.nm_no_ext_drivers = env.nm_modules
         env.nic_profiles = ['common', 'onload', 'csum']
@@ -647,6 +664,19 @@ def hostenv(env):
         #env.priv_ring_num = 16
         #env.priv_buf_num = 32000
         #env.priv_ring_size = 33024  # accommodate 2048 slots
+        env.priv_if_num = 2
+        env.priv_ring_num = 2
+        env.priv_buf_num = 16
+        env.priv_ring_size = 33024  # accommodate 2048 slots
+
+    elif name == 'va2':
+        linux_defaults(env)
+        env.linux_config = 'cur'
+        env.ifs = ['ens6']
+        env.nm_modules = ['virtio_net.c']
+        env.nm_no_ext_drivers = env.nm_modules
+        env.nic_profiles = ['common', 'onload', 'csum']
+        env.no_clflush = True;
         env.priv_if_num = 2
         env.priv_ring_num = 2
         env.priv_buf_num = 16
@@ -723,15 +753,20 @@ def hostenv(env):
         env.priv_buf_num = 640000
         env.priv_ring_size = 33024  # accommodate 2048 slots
 
-    elif name == 'cl0' or name == 'cl1' or name == 'cl2':
+    elif name == 'cl0' or name == 'cl1' or name == 'cl2' or name == 'cl3':
         env.home = '/users'
         linux_defaults(env)
+        #env.linux_src = '/dev/shm/net-next'
+        env.nm_modules = ['i40e']
+        if name == 'cl2':
+            env.nm_modules = ['ixgbe']
+        env.nm_no_ext_drivers = env.nm_modules
         env.linux_config = 'cur'
         env.nopmem = True
         #env.linux_src = ''
         env.ifs = ['ens1f0']
         if name == 'cl2' or name == 'cl3':
-            env.ifs = ['enp6s0f0', 'enp6s0f1']
+            env.ifs = ['enp6s0f0']
         env.ifs_addr = {env.ifs[0]:b2b_cl[0][0]}
         if name == 'cl1':
             env.ifs_addr = {env.ifs[0]:b2b_cl[0][1]}
@@ -739,14 +774,14 @@ def hostenv(env):
         #if name == 'cl2':
         #    env.nm_modules = ['ixgbe']
         #env.nm_no_ext_drivers = env.nm_modules
-        env.nic_profiles = ['common', 'onload', 'csum', 'singleq', 'noim']
-        if name != 'cl0':
-            env.nic_profiles = ['common', 'offload', 'csum', 'mq', 'noim']
-        if name == 'cl0' or name =='cl2':
-            env.priv_if_num = 32
-            env.priv_ring_num = 320
-            env.priv_buf_num = 400000
-            env.priv_ring_size = 33024  # accommodate 2048 slots
+        env.nic_profiles = ['common', 'onload', 'csum', 'mq', 'noim']
+        #if name != 'cl0' and name != 'cl2':
+        #    env.nic_profiles = ['common', 'offload', 'csum', 'mq', 'noim']
+        #if name == 'cl0' or name =='cl2':
+        env.priv_if_num = 32
+        env.priv_ring_num = 320
+        env.priv_buf_num = 400000
+        env.priv_ring_size = 33024  # accommodate 2048 slots
 
     else:
         linux_defaults(env)

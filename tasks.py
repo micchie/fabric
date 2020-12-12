@@ -53,8 +53,8 @@ def rsync_upload(c, src, dst, nogit=False, delete=False):
     ssh_agent = os.environ.get('SSH_AUTH_SOCK', None)
     if ssh_agent:
         c.config['run']['env']['SSH_AUTH_SOCK'] = ssh_agent
-    rsync(c, src, dst, delete=delete, exclude=exclude, rsync_opts='-q')
-
+    rsync(c, src, dst, delete=delete, exclude=exclude, rsync_opts='-q',
+            ssh_opts=get_ssh_opts(c))
 
 def norm(s):
     s = re.sub("^\s+", "", s)
@@ -80,6 +80,12 @@ def _hostenv(c, output=False):
     c.output = c.original_host + '.log' if output else None
     return c
 
+# Survive broken proxycommand handler of rsync
+def get_ssh_opts(c):
+    if 'proxycommand' in c.ssh_config:
+        return '-o "ProxyCommand {}"'.format(c.ssh_config['proxycommand'])
+    return ''
+
 @task
 def rsynctest(c, host, src, dst):
     c = Connection(host)
@@ -87,24 +93,13 @@ def rsynctest(c, host, src, dst):
     ssh_agent = os.environ.get('SSH_AUTH_SOCK', None)
     if ssh_agent:
         c.config['run']['env']['SSH_AUTH_SOCK'] = ssh_agent
-    rsync(c, src, dst)
+    rsync(c, src, dst, ssh_opts=get_ssh_opts(c))
 
 @task
 def test(c, host):
     c = Connection(host)
     print('c', c)
-    c = hostenv(c)
-    with c.cd(c.linux_src):
-        print('freeing up some space')
-        lines = c.run('find . | grep "\.ko$"').stdout
-        lines = lines.replace('\n', ' ')
-        print('lines', lines)
-        #for l in lines.split('\n'):
-        #    if len(l): c.run('echo {}'.format(l.strip('\n')), echo=True)
-    #c.run('ls')
-    #c.local('ls')
-    #s = c.run('uname -r', hide=True)
-    #print(s.stdout.split('-')[0])
+    c.run('ls')
 
 @task
 def test2(c, host):
@@ -133,6 +128,7 @@ def setup_irq(c, host=None):
     for i in c.ifs:
         s = 'cat /proc/interrupts | grep "{}-TxRx" | tr -s " " | sed "s/^ //"'
         r = c.run(s.format(i), hide='stdout', echo=True, warn=True)
+        print('r.stdout', r.stdout)
         if not r.stdout:
             nomq = True
             r = c.run(s.replace('-TxRx', '').format(i), echo=True, warn=True)
@@ -163,6 +159,8 @@ def setup_ifs(c, host=None, ifs=None, profiles=[]):
         profiles = c.nic_profiles
     print('Ensuring no HT enabled')
     noht(c, host)
+    # ncpus may has changed
+    c.ostype, c.ncpus = ostype_and_ncores(c)
 
     # configure interfaces
     for i in ifs:
@@ -181,9 +179,10 @@ def setup_ifs(c, host=None, ifs=None, profiles=[]):
             if is_linux(c):
                 # warn on the address already exists
                 c.sudo('ip addr add {} dev {}'.format(c.ifs_addr[i], i),
-                        warn=True)
+                        warn=True, echo=True)
             elif is_freebsd(c):
-                c.sudo('ifconfig %s inet %s' % (i, c.ifs_addr[i]), warn=True)
+                c.sudo('ifconfig %s inet %s' % (i, c.ifs_addr[i]), warn=True,
+                        echo=True)
 
 def _enable_netmap_debug(c):
     f = os.path.join(c.netmap_src, 'sys/dev/netmap/netmap_kern.h')
@@ -218,7 +217,7 @@ def unload_netmap(c):
     c.sudo('rmmod netmap', warn=True)
 
 @task
-def load_netmap(c, host=None):
+def load_netmap(c, host=None, debug=False):
     c = ensure_connected(c, host)
     if is_freebsd(c):
         for v, k in ((c.priv_if_num, 'if_num'), (c.priv_ring_num,
@@ -236,6 +235,8 @@ def load_netmap(c, host=None):
             c.sudo('modprobe ' + m)
     time.sleep(1)
     for m in c.nm_modules:
+        if re.search('\.c', m):
+            m = m.strip('\.c')
         if c.run('lsmod | grep ^' + m, warn=True, hide='both').exited == 0:
             c.sudo('rmmod ' + m, warn=True) # XXX e1000e against e1000
             #sudo('modprobe -r ' + m, warn_only=True) # XXX e1000e against e1000
@@ -254,6 +255,9 @@ def load_netmap(c, host=None):
             (c.priv_buf_num, 'buf_num'), (c.priv_ring_size, 'ring_size')):
         c.sudo('bash -c "echo %d >> /sys/module/netmap/parameters/priv_%s"'%(v,
             k), echo=True)
+    if debug:
+        c.sudo('bash -c "echo 65536 >> /sys/module/netmap/parameters/debug"',
+            echo=True)
     #sudo('echo %d > /sys/module/netmap/parameters/debug'%65536)
     setup_ifs(c, c.ifs, profiles=c.nic_profiles)
     print('done load_netmap')
@@ -344,7 +348,7 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
                 c.run('make')
         make_netmap_apps(c, src=src)
         if not noload:
-            load_netmap(c)
+            load_netmap(c, debug=debug)
 
     elif is_freebsd(c):
         with cd(env.netmap_src):
@@ -371,11 +375,11 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
     print('done make_netmap')
 
 @task
-def make_linux(c, host, src, noupload=False, config=False,
+def make_linux(c, host, src=None, config=False,
         debug=False, trace=False, opt=False, pmem=False, nospace=False):
     c = Connection(host)
     _hostenv(c)
-    if not noupload:
+    if src:
         rsync_upload(c, src, c.linux_src, nogit=c.nogit, delete=(not not config))
     if config:
         with c.cd(c.linux_src):
@@ -472,10 +476,10 @@ def config_linux(c, debug, trace, opt, pmem):
     d.update({k:'m' for k in virtio_config})
 
     # netmap drivers
-    nic_config = {'E1000':'m', 'E1000E':'y', 'IGB':'m', 'IGB_HWMON':'y',
+    nic_config = {'DCB':'n', 'E1000':'m', 'E1000E':'y', 'IGB':'m', 'IGB_HWMON':'y',
                   'IGB_DCA':'y', 'IGBVF':'m', 'IXGBE':'m', 'IXGBE_HWMON':'y',
-                  'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'y', 'IXGBEVF':'m',
-                  'I40E':'m', 'I40EVF':'m', 'VETH':'m', 'INFINIBAND':'n'}
+                  'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'n', 'IXGBEVF':'m',
+                  'I40E':'m', 'I40EVF':'m', 'I40E_DCB':'n', 'VETH':'m', 'INFINIBAND':'n'}
     d.update(nic_config)
 
     # mellanox
@@ -538,7 +542,7 @@ def config_linux(c, debug, trace, opt, pmem):
               'TIFM_CORE', 'ICS932S401', 'ENCLOSURE_SERVICES', 'SGI_XP',
               'APDS9802ALS', 'ISL29003', 'ISL29020', 'SENSORS_TSL2550',
               'SENSORS_BH1770', 'SENSORS_APDS990X', 'HMC6352', 'DS1682',
-              'VMWARE_BALLOON'
+              'VMWARE_BALLOON', 'AGP', 'I2C_NVIDIA_GPU', 'VGA_ARB',
               ]
     d.update({k:'n' for k in noconfigs})
 

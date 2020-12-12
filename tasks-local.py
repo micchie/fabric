@@ -60,34 +60,31 @@ def setup(c):
     c = Connection('localhost')
     c.netmap_src = os.path.join(c.run('pwd', hide='both').stdout.strip(),
             'deployed/netmap')
-    # identify node type
-    r = c.run('uname -a').stdout
-    if re.search('c220g2', r):
-        c.ifs = ['enp6s0f0']
-        c.netmap_modules = ['ixgbe']
-    elif re.search('c220g5', r):
-        c.ifs = ['ens1f0']
-        c.netmap_modules = ['i40e']
-    # remember the IP address
-    a = c.run("ip addr show dev {} | grep inet | grep -v inet6 "
-              "| tr -s ' ' | cut -d ' ' -f3".format(c.ifs[0]),
-              echo=True, warn=True).stdout.strip('\n')
-    c.ifs_addr = {c.ifs[0]:a} if len(a) else {c.ifs[0]:'10.10.1.1/24'}
+    # identify the NIC name
+    cmd = ('ip addr show to 10.10.1.0/24 | grep ^[0-9]: | cut -d " " -f2'
+          ' | sed "s/:$//"')
+    ifname = c.run(cmd, echo=True).stdout.strip()
+    cmd = 'ethtool -i {} | grep ^drive | cut -d: -f2 | tr -d " "'.format(ifname)
+    driver = c.run(cmd, echo=True).stdout.strip()
+    cmd = 'ip addr show to 10.10.1.0/24 | grep inet | tr -s " " | cut -d" " -f3'
+    addr = c.run(cmd, echo=True).stdout.strip()
+    c.ifs = [ifname]
+    c.netmap_modules = [driver]
+    c.ifs_addr = {c.ifs[0]:addr}
 
     singleq = True
     lowintr = False # don't enable for i40e driver
 
-    for m in c.netmap_modules:
+    for m in c.netmap_modules + ['netmap']:
         c.sudo('rmmod {}'.format(m), warn=True, echo=True)
-    c.sudo('rmmod netmap', warn=True, echo=True)
 
     c.sudo('insmod ' + '{}/netmap.ko'.format(c.netmap_src), echo=True)
     for m in c.netmap_modules:
         c.sudo('insmod {}'.format(os.path.join(c.netmap_src, m, m+'.ko')),
             warn=True, echo=True)
     # disable HT
-    c.sudo('bash -c "echo off > /sys/devices/system/cpu/smt/control"',warn=True,
-            echo=True)
+    c.sudo('bash -c "echo off > /sys/devices/system/cpu/smt/control"',
+            warn=True, echo=True)
     time.sleep(1)
 
     # obtain CPU core count
@@ -108,15 +105,16 @@ def setup(c):
                 'ethtool -K {} tx-checksum-ip-generic on', # ixgbe
                 'ethtool -K {} tx-checksum-ipv4 on' # i40e
                ]
+
+        cmds.append('ethtool -L {} ' +
+                'combined {}'.format(1 if singleq else ncpus))
+        intr = 1022 if lowintr else 0
+        cmds.append('ethtool -C {} ' +
+                'rx-usecs {} tx-usecs {}'.format(intr, intr))
+        cmds.append('ethtool -C {} adaptive-rx off adaptive-tx off ' +
+               'rx-usecs {} tx-usecs {}'.format(intr, intr))
         for cmd in cmds:
             c.sudo(cmd.format(i), echo=True, warn=True)
-        intr = 1022 if lowintr else 0
-        c.sudo('ethtool -C {} rx-usecs {} tx-usecs {}'.format(i, intr, intr),
-                echo=True, warn=True)
-        c.sudo('ethtool -C {} adaptive-rx off adaptive-tx off '
-               'rx-usecs {} tx-usecs {}'.format(i, intr, intr),
-                echo=True, warn=True)
-        c.sudo('ethtool -L {} combined {}'.format(i, 1 if singleq else ncpus))
 
     nomq = False
     for i in c.ifs:
