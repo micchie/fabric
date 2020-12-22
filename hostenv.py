@@ -669,17 +669,52 @@ def hostenv(env):
         env.priv_buf_num = 16
         env.priv_ring_size = 33024  # accommodate 2048 slots
 
-    elif name == 'va2':
+    elif name == 'va2' or name == 'va3':
         linux_defaults(env)
         env.linux_config = 'cur'
         env.ifs = ['ens6']
-        env.nm_modules = ['virtio_net.c']
+        #env.nm_modules = ['virtio_net.c']
+        env.nm_modules = ['e1000']
         env.nm_no_ext_drivers = env.nm_modules
         env.nic_profiles = ['common', 'onload', 'csum']
         env.no_clflush = True;
-        env.priv_if_num = 2
-        env.priv_ring_num = 2
-        env.priv_buf_num = 16
+        env.priv_if_num = 8
+        env.priv_ring_num = 32
+        env.priv_buf_num = 160000
+        env.priv_ring_size = 33024  # accommodate 2048 slots
+
+    elif name == 'o02':
+        linux_defaults(env)
+        env.linux_config = 'cur'
+        env.nm_modules = ['ixgbe']
+        env.nm_no_ext_drivers = env.nm_modules
+        env.nic_profiles = ['common', 'onload', 'csum', 'noim', 'mq']
+        env.priv_if_num = 32
+        env.priv_ring_num = 128
+        env.priv_buf_num = env.priv_ring_num*2048*10
+        env.priv_ring_size = 33024  # accommodate 2048 slots
+
+    elif name == 'n01' or name == 'n02' or name == 'n04' or name == 'n05':
+        linux_defaults(env)
+        env.nrings = int(env.ncpus/4)
+        env.nrings = 2
+        env.linux_config = 'cur'
+        if name == 'n01':
+            env.ifs = ['ens1f0', 'ens1f1']
+        elif name == 'n02':
+            env.ifs = ['enp6s0f0', 'enp6s0f1']
+        else:
+            env.ifs = ['enp1s0f0', 'enp1s0f1']
+        if name == 'n01' or 'n04':
+            env.ifs_addr = {env.ifs[0]: b2b[0][0], env.ifs[1]: b2b[1][0]}
+        else:
+            env.ifs_addr = {env.ifs[0]: b2b[0][1], env.ifs[1]: b2b[1][1]}
+        env.nm_modules = ['i40e']
+        env.nm_no_ext_drivers = env.nm_modules
+        env.nic_profiles = ['common', 'onload', 'csum', 'noim', 'mq']
+        env.priv_if_num = 32
+        env.priv_ring_num = 256
+        env.priv_buf_num = env.priv_ring_num*2048*10
         env.priv_ring_size = 33024  # accommodate 2048 slots
 
     #elif name == 'va2':
@@ -696,22 +731,27 @@ def hostenv(env):
     #    env.fbsd_config = 'FAB'
     #    env.nic_profiles = ['common', 'onload']
 
-    elif name == 'va3':
-        linux_defaults()
-        env.ifs = ['eth1']
-        #env.ifs_addr = {'eth1':'192.168.18.2'}
-        env.ifs_addr = {'eth1':'192.168.11.4/24'}
-        env.ifs_mac = {'eth1':'08:00:27:0f:15:fd'}
-        #env.ifs_def_dst_addr = {'eth1':b2b[0][0], 'eth2':b2b[1][0]}
-        #env.ifs_def_dst_mac = {'eth1':'00:00:27:18:dd:ff',
-        #                        'eth2':'00:00:27:ef:1c:e2'}
-        env.def_sport = def_ports[1]
-        env.def_dport = def_ports[0]
-        env.nm_modules = ['e1000', 'i40e', 'ixgbe']
-        env.nm_no_ext_drivers = ['i40e', 'ixgbe']
-        env.nic_profiles = ['common', 'onload', 'csum']
-        #env.nic_profiles = ['common', 'onload']
-        env.no_clflush = True;
+    #elif name == 'va3':
+    #    linux_defaults(env)
+    #    env.linux_config = 'cur'
+    #    env.ifs = ['eth0']
+    #    #env.ifs_addr = {'eth1':'192.168.18.2'}
+    #    #env.ifs_addr = {'eth1':'192.168.11.4/24'}
+    #    #env.ifs_mac = {'eth1':'08:00:27:0f:15:fd'}
+    #    #env.ifs_def_dst_addr = {'eth1':b2b[0][0], 'eth2':b2b[1][0]}
+    #    #env.ifs_def_dst_mac = {'eth1':'00:00:27:18:dd:ff',
+    #    #                        'eth2':'00:00:27:ef:1c:e2'}
+    #    env.def_sport = def_ports[1]
+    #    env.def_dport = def_ports[0]
+    #    env.nm_modules = ['virtio_net.c', 'i40e', 'ixgbe']
+    #    env.nm_no_ext_drivers = env.nm_modules
+    #    env.nic_profiles = ['common', 'onload', 'csum']
+    #    #env.nic_profiles = ['common', 'onload']
+    #    env.no_clflush = True;
+    #    env.priv_if_num = 2
+    #    env.priv_ring_num = 2
+    #    env.priv_buf_num = 16
+    #    env.priv_ring_size = 33024  # accommodate 2048 slots
 
     elif name == 'localhost':
         env.nogit=True

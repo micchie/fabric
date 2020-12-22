@@ -142,11 +142,14 @@ def setup_irq(c, host=None):
             c.sudo('bash -c "echo {:x} >> {}"'.format(1 << cor, p), echo=True)
 
 def do_ifcmd(c, cmd, ifname):
-    n = (ifname, c.ncpus) # second argument is only for mq profile
+    nrings = c.ncpus
+    if 'nrings' in c:
+        nrings = c.nrings
+    n = (ifname, nrings) # second argument is only for mq profile
     if is_freebsd(c) and re.search('sysctl', cmd):
         ift = re.split('[0-9]', ifname)[0]
         ifi = ifname[len(ift):len(ifname)]
-        n = ('{}.{}'.format(ift, ifi), '{}'.format(c.ncpus))
+        n = ('{}.{}'.format(ift, ifi), '{}'.format(nrings))
     c.sudo(cmd.format(*n), warn=True, echo=True)
 
 @task
@@ -216,8 +219,7 @@ def unload_netmap(c):
             r = c.sudo('rmmod ' + m)
     c.sudo('rmmod netmap', warn=True)
 
-@task
-def load_netmap(c, host=None, debug=False):
+def _load_netmap(c, host=None, debug=False):
     c = ensure_connected(c, host)
     if is_freebsd(c):
         for v, k in ((c.priv_if_num, 'if_num'), (c.priv_ring_num,
@@ -261,6 +263,10 @@ def load_netmap(c, host=None, debug=False):
     #sudo('echo %d > /sys/module/netmap/parameters/debug'%65536)
     setup_ifs(c, c.ifs, profiles=c.nic_profiles)
     print('done load_netmap')
+
+@task
+def load_netmap(c, host, debug=False):
+    _load_netmap(c, host=host, debug=debug)
 
 def _make_netmap_linux(c, path, config, apps=False ,drivupload=False):
     # let's get kernel source path
@@ -348,7 +354,7 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
                 c.run('make')
         make_netmap_apps(c, src=src)
         if not noload:
-            load_netmap(c, debug=debug)
+            _load_netmap(c, debug=debug)
 
     elif is_freebsd(c):
         with cd(env.netmap_src):
@@ -395,7 +401,7 @@ def make_linux(c, host, src=None, config=False,
             for b in batches:
                 c.run('rm {}'.format(' '.join(b)), echo=True)
     print('installing the new kernel to {}'.format(c.linux_src))
-    c.sudo('bash -c "cd {} && make modules_install"'.format(c.linux_src))
+    c.sudo('bash -c "cd {} && make INSTALL_MOD_STRIP=1 modules_install"'.format(c.linux_src))
     c.sudo('bash -c "cd {} && make install"'.format(c.linux_src))
 
 def update_kconfig(c, d, conffile):
@@ -449,13 +455,17 @@ def config_linux(c, debug, trace, opt, pmem):
 
     # y for systemtap, otherwise n
     if trace:
-        trace_config = ['RELAY', 'DEBUG_FS', 'DEBUG_INFO', 'KPROBES',
-                        'KPROBE_EVENTS',
-                        'DEBUG_INFO_DWARF4', 'ENABLE_MUST_CHECK',
-                        'FRAME_POINTER', 'DEBUG_KERNEL', 'KALLSYMS_ALL',
-                        'BPF_SYSCALL', 'BPF_EVENTS', 'BPF_JIT_ALWAYS_ON']
-        d.update({k:'y' for k in trace_config})
-        d.update({'DEBUG_INFO_REDUCED':'n'})
+        #trace_config = ['RELAY', 'DEBUG_FS', 'DEBUG_INFO', 'KPROBES',
+        #                'KPROBE_EVENTS',
+        #                'DEBUG_INFO_DWARF4', 'ENABLE_MUST_CHECK',
+        #                'FRAME_POINTER', 'DEBUG_KERNEL', 'KALLSYMS_ALL',
+        #                'BPF_SYSCALL', 'BPF_EVENTS', 'BPF_JIT_ALWAYS_ON']
+        #d.update({k:'y' for k in trace_config})
+        # followings are not enabled in Ubuntu focal by default
+        trace_non_default_config = {'ENABLE_MUST_CHECK':'y',
+                'KALLSYMS_ALL':'y',
+                'DEBUG_INFO_REDUCED':'n'}
+        d.update({k:'y' for k in trace_non_default_config})
 
     # General kernel debug (disable if unnecessary)
     if debug:
@@ -466,39 +476,41 @@ def config_linux(c, debug, trace, opt, pmem):
         d.update({k:'y' for k in dbg_config})
 
     ## virtio - based on http://www.linux-kvm.org/page/Virtio
-    virtio_config = {'VIRTIO_MENU', 'VIRTIO_PCI', 'VIRTIO_PCI_LEGACY',
-                     'VIRTIO_BALLOON', 'VIRTIO_BLK', 'VIRT_DRIVERS',
-                     'VIRTIO_CMDLINE_DEVICES'}
-    d.update({k:'y' for k in virtio_config})
+    #virtio_config = {'VIRTIO_MENU', 'VIRTIO_PCI', 'VIRTIO_PCI_LEGACY',
+    #                 'VIRTIO_BALLOON', 'VIRTIO_BLK', 'VIRT_DRIVERS',
+    #                 'VIRTIO_CMDLINE_DEVICES'}
+    #d.update({k:'y' for k in virtio_config})
 
-    virtio_config = ['VIRTIO', 'VIRTIO_NET', 'VIRTIO_INPUT', 'VIRTIO_MMIO',
-                     'VBOXGUEST', 'VIRTIO_CONSOLE', 'VIRTIO_BLK']
-    d.update({k:'m' for k in virtio_config})
+    #virtio_config = ['VIRTIO', 'VIRTIO_NET', 'VIRTIO_INPUT', 'VIRTIO_MMIO',
+    #                 'VBOXGUEST', 'VIRTIO_CONSOLE', 'VIRTIO_BLK']
+    #d.update({k:'m' for k in virtio_config})
 
     # netmap drivers
-    nic_config = {'DCB':'n', 'E1000':'m', 'E1000E':'y', 'IGB':'m', 'IGB_HWMON':'y',
-                  'IGB_DCA':'y', 'IGBVF':'m', 'IXGBE':'m', 'IXGBE_HWMON':'y',
-                  'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'n', 'IXGBEVF':'m',
-                  'I40E':'m', 'I40EVF':'m', 'I40E_DCB':'n', 'VETH':'m', 'INFINIBAND':'n'}
-    d.update(nic_config)
+    #nic_config = {'DCB':'n', 'E1000':'m', 'E1000E':'y', 'IGB':'m', 'IGB_HWMON':'y',
+    #              'IGB_DCA':'y', 'IGBVF':'m', 'IXGBE':'m', 'IXGBE_HWMON':'y',
+    #              'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'n', 'IXGBEVF':'m',
+    #              'I40E':'m', 'I40EVF':'m', 'I40E_DCB':'n', 'VETH':'m', 'INFINIBAND':'n'}
+    #d.update(nic_config)
+    nodcb_config = {'DCB':'n'}
+    d.update(nodcb_config)
 
     # mellanox
-    mlx_config = {'NET_VENDOR_MELLANOX':'y', 'MLX4_EN':'m', 'MLX4_CORE':'m',
-                  'MLX4_DEBUG':'y', 'MLX4_CORE_GEN2':'y', 'MLX5_CORE':'m',
-                  'MLX5_CORE_EN':'y', 'MLX5_EN_ARFS':'y', 'MLX5_EN_RXNFC':'y',
-                  'MLX5_MPFS':'y', 'MLX4_ESWITCH':'y', 'MLX5_CORE_IPOIB':'y',
-                  'MLX5_SW_STEERING':'y'}
-    d.update(mlx_config)
+    #mlx_config = {'NET_VENDOR_MELLANOX':'y', 'MLX4_EN':'m', 'MLX4_CORE':'m',
+    #              'MLX4_DEBUG':'y', 'MLX4_CORE_GEN2':'y', 'MLX5_CORE':'m',
+    #              'MLX5_CORE_EN':'y', 'MLX5_EN_ARFS':'y', 'MLX5_EN_RXNFC':'y',
+    #              'MLX5_MPFS':'y', 'MLX4_ESWITCH':'y', 'MLX5_CORE_IPOIB':'y',
+    #              'MLX5_SW_STEERING':'y'}
+    #d.update(mlx_config)
 
     # netmap after 4.17
     ax25_config = {'HAMRADIO':'y', 'AX25':'y'}
     d.update(ax25_config)
 
-    tun_config = {'NET_IPIP':'m', 'NET_L3_MASTER_DEV':'y', 'BPF_JIT':'y',
-                  'NET_SWITCHDEV':'y', 'NET_IPGRE':'m', 'NET_IPGRE_DEMUX':'m',
-                  'NET_IPGRE_BROADCAST':'y', 'NET_IP_TUNNEL':'y',
-                  'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
-    d.update(tun_config)
+    #tun_config = {'NET_IPIP':'m', 'NET_L3_MASTER_DEV':'y', 'BPF_JIT':'y',
+    #              'NET_SWITCHDEV':'y', 'NET_IPGRE':'m', 'NET_IPGRE_DEMUX':'m',
+    #              'NET_IPGRE_BROADCAST':'y', 'NET_IP_TUNNEL':'y',
+    #              'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
+    #d.update(tun_config)
 
     noconfigs = ['IP_SCTP', 'IP_DCCP', 'SWAP', 'SOUND', 'AUDIT',
               'NET_VENDOR_3COM', 'E100', 'NET_VENDOR_MICROSEMI',
@@ -543,6 +555,26 @@ def config_linux(c, debug, trace, opt, pmem):
               'APDS9802ALS', 'ISL29003', 'ISL29020', 'SENSORS_TSL2550',
               'SENSORS_BH1770', 'SENSORS_APDS990X', 'HMC6352', 'DS1682',
               'VMWARE_BALLOON', 'AGP', 'I2C_NVIDIA_GPU', 'VGA_ARB',
+              'TOSHIBA_HAPS', 'TOSHIBA_BT_RFKILL',
+              'MMC_TOSHIBA_PCI', 'PATA_SERVERWORKS',
+              'PATA_ALI', 'PATA_AMD', 'PATA_ARTOP', 'PATA_ATIIXP',
+              'PATA_ATP867X', 'PATA_CMD64X', 'PATA_EFAR', 'PATA_HPT366',
+              'PATA_HPT37X', 'PATA_IT8213', 'PATA_IT821X', 'PATA_JMICRON',
+              'PATA_MARVELL', 'PATA_MPIIX', 'PATA_NETCELL', 'PATA_NINJA32',
+              'PATA_NS87410', 'PATA_NS87415', 'PATA_OLDPIIX', 'PATA_PDC2027X',
+              'PATA_PDC_OLD', 'PATA_RDC', 'PATA_RZ1000', 'PATA_SAMSUNG_CF',
+              'PATA_SCH', 'PATA_SERVERWORKS', 'PATA_SIL680', 'PATA_SIS',
+              'PATA_TOSHIBA', 'PATA_TRIFLEX', 'PATA_VIA', 'GNSS' 'MMC',
+              'NET_9P', 'EISA', 'JFS_FS', 'PARPORT', 'IEEE802154_DRIVERS',
+              'GAMEPORT', 'MSPRO_BLOCK', 'MS_BLOCK', 'MEMSTICK_TIFM_MS',
+              'MEMSTICK_JMICRON_38X', 'MEMSTICK_R592', 'MEMSTICK_REALTEK_PCI',
+              'MEMSTICK_REALTEK_USB', 'HYPERV', 'ANDROID', 'PATA_CYPRESS',
+              'PATA_HPT3X2N', 'PATA_HPT3X3', 'PATA_OPTIDMA', 'PATA_RADISYS',
+              'PATA_SIS', 'PATA_WINBOND', 'PATA_ACPI', 'PATA_LEGACY',
+              'PATA_OPTI',
+              'PATA_CMD640_PCI', 'PATA_PLATFORM', 'PATA_TIMINGS', 'ATA',
+              'ATA_VERBOSE_ERROR', 'ATA_FORCE', 'ATA_ACPI', 'ATA_SFF',
+              'ATA_BMDMA', 'ATA_PIIX'
               ]
     d.update({k:'n' for k in noconfigs})
 
@@ -563,11 +595,11 @@ def config_linux(c, debug, trace, opt, pmem):
     #    d.update(nvm_config)
 
     # NVMe
-    nvme_config = ['NVME_CORE', 'BLK_DEV_NVME', 'NVME_MULTIPATH']
-    d.update({k:'y' for k in nvme_config})
-    nvme_config = ['NVME_FABRICS', 'NVME_RDMA', 'NVME_TCP', 'NVME_TARGEt',
-                   'NVME_TARGET_LOOP', 'NVME_TARGET_RDMA', 'NVME_TARGET_TCP']
-    d.update({k:'m' for k in nvme_config})
+    #nvme_config = ['NVME_CORE', 'BLK_DEV_NVME', 'NVME_MULTIPATH']
+    #d.update({k:'y' for k in nvme_config})
+    #nvme_config = ['NVME_FABRICS', 'NVME_RDMA', 'NVME_TCP', 'NVME_TARGEt',
+    #               'NVME_TARGET_LOOP', 'NVME_TARGET_RDMA', 'NVME_TARGET_TCP']
+    #d.update({k:'m' for k in nvme_config})
 
     # Small optimization
     #opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
