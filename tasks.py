@@ -67,7 +67,7 @@ def ostype_and_ncores(c):
         r = c.run('cat /proc/cpuinfo | egrep ^processor | wc', hide='both').stdout
         ncpus = int( norm(r)[1][0] )
     elif ostype == 'FreeBSD':
-        r = c.run("sysctl hw.ncpu | cut -d' ' -f2").stdout
+        r = c.run("sysctl hw.ncpu | cut -d' ' -f2", hide=True).stdout
         ncpus = int(r)
     else:
         print('Unsupported OS %s' % ostype)
@@ -109,7 +109,7 @@ def test2(c, host):
 
 def _exists(c, s):
     if is_freebsd(c):
-        r = c.run('test -e %s'%s, warn_only=True)
+        r = c.run('test -e %s'%s, warn=True)
         return True if r.exited == 0 else False
     return files.exists(c, s)
 
@@ -152,16 +152,16 @@ def do_ifcmd(c, cmd, ifname):
         n = ('{}.{}'.format(ift, ifi), '{}'.format(nrings))
     c.sudo(cmd.format(*n), warn=True, echo=True)
 
-@task
-def setup_ifs(c, host=None, ifs=None, profiles=[]):
+def _setup_ifs(c, host=None, ifs=None, profiles=[]):
 
     c = ensure_connected(c, host)
     if not ifs:
         ifs = c.ifs
     if not profiles:
         profiles = c.nic_profiles
-    print('Ensuring no HT enabled')
-    noht(c, host)
+    if is_linux(c):
+        print('Ensuring no HT enabled')
+        noht(c, host)
     # ncpus may has changed
     c.ostype, c.ncpus = ostype_and_ncores(c)
 
@@ -174,7 +174,8 @@ def setup_ifs(c, host=None, ifs=None, profiles=[]):
             for cmd in cmdlist:
                 do_ifcmd(c, cmd, i)
     # set irq properly if possible
-    setup_irq(c, host)
+    if is_linux(c):
+        setup_irq(c, host)
 
     # configure IP addresses
     for i in ifs:
@@ -226,7 +227,15 @@ def _load_netmap(c, host=None, debug=False):
                 'ring_num'), (c.priv_buf_num, 'buf_num'),
                 (c.priv_ring_size, 'ring_size')):
             c.sudo('sysctl -w dev.netmap.priv_%s=%d'%(k, v))
-        setup_ifs(c.ifs, profiles=c.nic_profiles)
+        _setup_ifs(c, c.ifs, profiles=c.nic_profiles)
+        if debug:
+            verbose = 1
+            debug = 65536
+        else:
+            verbose = 0
+            debug = 0
+        c.sudo('sysctl -w dev.netmap.verbose={}'.format(verbose))
+        c.sudo('sysctl -w dev.netmap.debug={}'.format(debug), warn=True)
         return
     unload_netmap(c)
 
@@ -253,22 +262,40 @@ def _load_netmap(c, host=None, debug=False):
         else:
             raise Exception('Couldn\'t find %s.ko!'%m)
 #        for v, k in ((32, 'if_num'), (64, 'ring_num'), (32784, 'buf_num'), (36864, 'ring_size')):
+
+    # setup queue first
+    for i in c.ifs:
+        for p in c.nic_profiles:
+            cmdlist = []
+            if p in c.nic_all_profiles:
+                cmdlist = c.nic_all_profiles[p]
+            for cmd in cmdlist:
+                if 'ethtool -L' in cmd:
+                    do_ifcmd(c, cmd, i)
+
     for v, k in ((c.priv_if_num, 'if_num'), (c.priv_ring_num, 'ring_num'),
             (c.priv_buf_num, 'buf_num'), (c.priv_ring_size, 'ring_size')):
         c.sudo('bash -c "echo %d >> /sys/module/netmap/parameters/priv_%s"'%(v,
             k), echo=True)
     if debug:
+        c.sudo('bash -c "echo 16384 >> /sys/module/netmap/parameters/verbose"',
+            echo=True)
         c.sudo('bash -c "echo 65536 >> /sys/module/netmap/parameters/debug"',
             echo=True)
+        c.sudo('bash -c "echo 7 >> /proc/sys/kernel/printk"')
     #sudo('echo %d > /sys/module/netmap/parameters/debug'%65536)
-    setup_ifs(c, c.ifs, profiles=c.nic_profiles)
+    _setup_ifs(c, c.ifs, profiles=c.nic_profiles)
     print('done load_netmap')
 
 @task
 def load_netmap(c, host, debug=False):
     _load_netmap(c, host=host, debug=debug)
 
-def _make_netmap_linux(c, path, config, apps=False ,drivupload=False):
+@task
+def setup_ifs(c, host, ifs=None, profiles=[]):
+    _setup_ifs(c, host, ifs=ifs, profiles=profiles)
+
+def _make_netmap_linux(c, path, config, apps=False, drivupload=False, load=False, debug=False):
     # let's get kernel source path
     if not c.linux_src:
         v = c.run('uname -r', hide=True).stdout.split('-')[0]
@@ -278,8 +305,9 @@ def _make_netmap_linux(c, path, config, apps=False ,drivupload=False):
         if not not config:
             if drivupload:
                 put('i*.tar.gz', 'LINUX/ext-drivers/')
-            cmd = './configure --disable-ptnetmap --disable-generic' + \
-                  ' --enable-extmem --enable-vale --enable-stack'
+            cmd = ('./configure --disable-ptnetmap --disable-generic'
+                  ' --enable-extmem --enable-paste')
+                  #' --disable-vale --enable-extmem')
             if apps:
                 cmd += ' --apps={}'.format(apps)
             else:
@@ -303,7 +331,10 @@ def _make_netmap_linux(c, path, config, apps=False ,drivupload=False):
         c.run(cmd)
 
 @task
-def make_netmap_apps(c, host=None, src=None):
+def make_netmap_apps(c, host, src=None, lib=False):
+    _make_netmap_apps(c, host=host, src=src, lib=lib)
+
+def _make_netmap_apps(c, host=None, src=None, lib=False):
     c = ensure_connected(c, host)
     makecmd = 'gmake' if is_freebsd(c) else 'make'
     appdir = os.path.join(c.netmap_src, 'apps')
@@ -312,19 +343,23 @@ def make_netmap_apps(c, host=None, src=None):
     if src:
         rsync_upload(c, os.path.join(src, os.path.basename(appdir)), appdir,
                 nogit=c.nogit)
-    with c.cd(c.netmap_src):
-        print(cmd)
-        c.run(cleancmd)
-        c.run(cmd)
+    if is_linux(c):  
+        with c.cd(c.netmap_src):
+    #    c.run(cleancmd, warn=True, echo=True)
+            c.run(cmd, warn=True, echo=True)
+    if lib:
+        with c.cd(os.path.join(c.netmap_src, 'libnetmap')):
+            c.run('{} clean'.format(makecmd))
+            c.run(makecmd)
     phttpd = os.path.join(appdir, 'phttpd')
     print('phttpd', phttpd, _exists(c, phttpd))
     if _exists(c, phttpd):
         with c.cd(phttpd):
-            c.run('make clean; make')
+            c.run('{} clean; {}'.format(makecmd, makecmd))
 
 @task
-def make_netmap(c, host, src=None, config=False, fbsddriv=False,
-        drivupload=False, debug=False, noload=False, apps=''):
+def make_netmap(c, host, src=None, config=False,
+        drivupload=False, debug=False, noload=False, apps='pkt-gen,vale-ctl'):
     c = ensure_connected(c, host)
 
     if src:
@@ -341,35 +376,31 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
                 c.put(os.path.join(src, f), os.path.join(c.netmap_src, f))
         else:
             rsync_upload(c, src, c.netmap_src, nogit=c.nogit, delete=config)
-    if debug:
-        _enable_netmap_debug(c)
     #tweak_netmap(env.netmap_src)
     libnetmappath = os.path.join(c.netmap_src, 'libnetmap')
     if is_linux(c):
+        if debug:
+            _enable_netmap_debug(c)
         _make_netmap_linux(c, c.netmap_src, config, apps, drivupload)
         if _exists(c, libnetmappath):
             with c.cd(libnetmappath):
                 #run('gcc -c nmreq.c -I../sys -DLIB')
                 #run('ar rcs libnetmap.a nmreq.o')
                 c.run('make')
-        make_netmap_apps(c, src=src)
+        _make_netmap_apps(c, src=src)
         if not noload:
             _load_netmap(c, debug=debug)
 
     elif is_freebsd(c):
-        with cd(env.netmap_src):
-            if not fbsddriv:
-                print('copying files')
-                #run('cp sys/dev/netmap/netmap* sys/dev/netmap/stackmap.c sys/dev/netmap/ptnetmap.c ' + os.path.join(env.fbsd_src,
-                run('cp sys/dev/netmap/netmap* ' + os.path.join(env.fbsd_src,
-                'sys/dev/netmap/'))
-                s = 'sys/dev/netmap/netmap_stack.c'
-                if _exists(os.path.join(env.netmap_src, s)):
-                    run('cp %s '%s + os.path.join(env.fbsd_src,
-                            'sys/dev/netmap/'))
-            else:
-                run('cp sys/dev/netmap/* ' + os.path.join(env.fbsd_src,
-                'sys/dev/netmap/'))
+        with c.cd(env.netmap_src):
+            print('copying files')
+            #run('cp sys/dev/netmap/netmap* sys/dev/netmap/stackmap.c sys/dev/netmap/ptnetmap.c ' + os.path.join(env.fbsd_src,
+            run('cp sys/dev/netmap/netmap* ' + os.path.join(env.fbsd_src,
+            'sys/dev/netmap/'))
+            s = 'sys/dev/netmap/netmap_stack.c'
+            if _exists(os.path.join(env.netmap_src, s)):
+                run('cp %s '%s + os.path.join(env.fbsd_src,
+                        'sys/dev/netmap/'))
             run('cp sys/net/netmap* ' + os.path.join(env.fbsd_src, 'sys/net/'))
         make_freebsd(None, upload=False, config=config, world=False)
         with cd(env.netmap_src):
@@ -377,7 +408,7 @@ def make_netmap(c, host, src=None, config=False, fbsddriv=False,
                 with cd(libnetmappath):
                     run('clang -c nmreq.c -I../sys -DLIB')
                     run('ar rcs libnetmap.a nmreq.o')
-        make_netmap_apps()
+        _make_netmap_apps()
     print('done make_netmap')
 
 @task
@@ -444,9 +475,9 @@ def config_linux(c, debug, trace, opt, pmem):
         if debug:
             print('debug cannot coexist with opt')
             debug = False
-        if trace:
-            print('trace cannot coexist with opt')
-            trace = False
+    #    if trace:
+    #        print('trace cannot coexist with opt')
+    #        trace = False
 
     d = {}
 
@@ -468,12 +499,22 @@ def config_linux(c, debug, trace, opt, pmem):
         d.update({k:'y' for k in trace_non_default_config})
 
     # General kernel debug (disable if unnecessary)
-    if debug:
-        dbg_config = ['UNINLINE_SPIN_UNLOCK', 'PREEMPT_COUNT', 'DEBUG_SPINLOCK',
+    dbg_config = ['UNINLINE_SPIN_UNLOCK', 'PREEMPT_COUNT', 'DEBUG_SPINLOCK',
                       'DEBUG_MUTEXES', 'DEBUG_LOCK_ALLOC', 'DEBUG_LOCKDEP',
                       'LOCKDEP', 'DEBUG_ATOMIC_SLEEP', 'TRACE_IRQFLAGS',
-                      'PROVE_RCU']
+                      'DETECT_HUNG_TASK', 'WQ_WATCHDOG',
+                      'LOCK_DEBUGGING_SUPPORT', 'DEBUG_RT_MUTEXES',
+                      'DEBUG_LIST', 'DEBUG_PLIST', 'DEBUG_NOTIFIERS',
+                      'BUG_ON_DATA_CORRUPTION', 'DEBUG_KOBJECT',
+                      'RCU_TORTURE_TEST', 'RCU_REF_SCALE_TEST',
+                      'RCU_TRACE', 'RCU_EQS_DEBUG',
+                      'DEBUG_WQ_FORCE_RR_CPU', 'DEBUG_BLOCK_EXT_DEVT',
+                      'CPU_HOTPLUG_STATE_CONTROL', 'LATENCYTOP',
+                      ]
+    if debug:
         d.update({k:'y' for k in dbg_config})
+    else:
+        d.update({k:'n' for k in dbg_config})
 
     ## virtio - based on http://www.linux-kvm.org/page/Virtio
     #virtio_config = {'VIRTIO_MENU', 'VIRTIO_PCI', 'VIRTIO_PCI_LEGACY',
@@ -512,7 +553,8 @@ def config_linux(c, debug, trace, opt, pmem):
     #              'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
     #d.update(tun_config)
 
-    noconfigs = ['IP_SCTP', 'IP_DCCP', 'SWAP', 'SOUND', 'AUDIT',
+    noconfigs = ['IP_SCTP', 'IP_DCCP', 'MPTCP', 'SWAP', 'SOUND', 'AUDIT',
+              'NETLABEL',
               'NET_VENDOR_3COM', 'E100', 'NET_VENDOR_MICROSEMI',
               'NET_VENDOR_MICROCHIP', 'NET_VENDOR_MYRI', 'NET_VENDOR_NETERION',
               'NET_VENDOR_ADAPTEC', 'NET_VENDOR_AGERE', 'NET_VENDOR_ALTEON',
@@ -568,12 +610,14 @@ def config_linux(c, debug, trace, opt, pmem):
               'NET_9P', 'EISA', 'JFS_FS', 'PARPORT', 'IEEE802154_DRIVERS',
               'GAMEPORT', 'MSPRO_BLOCK', 'MS_BLOCK', 'MEMSTICK_TIFM_MS',
               'MEMSTICK_JMICRON_38X', 'MEMSTICK_R592', 'MEMSTICK_REALTEK_PCI',
-              'MEMSTICK_REALTEK_USB', 'HYPERV', 'ANDROID', 'PATA_CYPRESS',
+              'MEMSTICK_REALTEK_USB', 'HYPERV', 'ANDROID'
+              , 'PATA_CYPRESS',
+              # 5.9-success
               'PATA_HPT3X2N', 'PATA_HPT3X3', 'PATA_OPTIDMA', 'PATA_RADISYS',
               'PATA_SIS', 'PATA_WINBOND', 'PATA_ACPI', 'PATA_LEGACY',
               'PATA_OPTI',
-              'PATA_CMD640_PCI', 'PATA_PLATFORM', 'PATA_TIMINGS', 'ATA',
-              'ATA_VERBOSE_ERROR', 'ATA_FORCE', 'ATA_ACPI', 'ATA_SFF',
+              'PATA_CMD640_PCI', 'PATA_PLATFORM', 'PATA_TIMINGS', #'ATA',
+              'ATA_VERBOSE_ERROR', 'ATA_FORCE', #'ATA_ACPI', 'ATA_SFF',
               'ATA_BMDMA', 'ATA_PIIX'
               ]
     d.update({k:'n' for k in noconfigs})
@@ -604,7 +648,7 @@ def config_linux(c, debug, trace, opt, pmem):
     # Small optimization
     #opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
     if opt:
-        opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
+        opt_config = {'NETFILTER':'n', 'RETPOLINE':'n', 'BPFILTER':'n'}
         d.update(opt_config)
 
     conffile = '.config'
@@ -644,10 +688,9 @@ def start_dgraph(c, host, mem='2048', nozero=False, noalpha=False,
             run_bg(c, 'dgraph-ratel')
 
 @task
-def config_newfs(c, host, dev, fstype='xfs', newfs=False):
+def config_newfs(c, host, dev, fstype='xfs', newfs=False, mnt='/mnt/ext'):
     c = ensure_connected(c, host)
 
-    mnt = '/mnt/ext'
     #opt = '-d su=4k,sw=1'
     opt = ''
 
@@ -665,12 +708,12 @@ def config_newfs(c, host, dev, fstype='xfs', newfs=False):
     if newfs:
         c.sudo('chmod 777 ' + mnt)
 
+# NOTE: if fail to enable DAX on real PMEM, try ndctl create-namespace -f -e namespace0.0 --mode=fsdax
 @task
-def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agcount=1):
+def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agcount=1, dev='/dev/pmem0'):
     c = ensure_connected(c, host)
 
     mnt = '/mnt/pmem'
-    dev = '/dev/pmem0'
     #opt = 'su=1024000k,sw=1'
     opt = ''
     if fstype == 'xfs':
@@ -705,7 +748,8 @@ def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agc
             if not agcount:
                 opt += 'su=256m,sw=1'
             else:
-                opt += 'agsize=1024000000'
+                #opt += 'agsize=512000000'
+                opt += 'agsize=128000000'
         #opt = 'agsize=256m,su=256m,sw=1'
         fsize /= 8
         c.sudo('mkfs.{} {} {}'.format(fstype, opt, devopt), echo=True)
@@ -717,5 +761,41 @@ def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agc
 #               (os.path.join(mnt, fname), bs, fsize/bs))
     c.sudo('chmod -R 777 ' + mnt, echo=True)
 
+@task
+def make_freebsd(c, host, src=None, config=False):
+    c = Connection(host)
+    _hostenv(c)
+    _make_freebsd(c, host=host, src=src, config=config)
+
+def _make_freebsd(c, host=None, src=None, config=False):
+    if src:
+        rsync_upload(c, src, c.fbsd_src, nogit=c.nogit,
+                delete=(not not config))
+    build_args = ''
+    if not config:
+        build_args += '-DKERNFAST '
+    with c.cd(c.fbsd_src):
+        c.run('make -j{} buildkernel {} KERNCONF={}'.format(c.ncpus+1,
+            build_args, c.fbsd_config))
+    # sudo doesn't work with cd...
+    c.sudo('bash -c "cd {} && make installkernel KERNCONF={}"'.format(c.fbsd_src,
+        c.fbsd_config))
+
+@task
+def make_netmap_freebsd(c, host, src=None, config=False):
+    c = Connection(host)
+    _hostenv(c)
+    if src:
+        rsync_upload(c, src, c.netmap_src, nogit=c.nogit, delete=config)
+        for d in ['sys/net', 'sys/dev/netmap']:
+            #print(os.path.join(src, d), os.path.join(c.fbsd_src, d))
+            c.run('cp {}/* {}'.format(os.path.join(c.netmap_src, d),
+                os.path.join(c.fbsd_src, d)), echo=True)
+            #rsync(c, os.path.join(src, d), os.path.join(c.fbsd_src, d))
+            #rsync_upload(c, os.path.join(src, d), os.path.join(c.fbsd_src, d),
+            #        nogit=c.nogit)
+    _make_freebsd(c, host=host, config=config)
+
 if __name__ == '__main__':
     test('va1')
+
