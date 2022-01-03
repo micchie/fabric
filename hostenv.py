@@ -14,6 +14,14 @@ b2b = [('192.168.%d.2/24' % (11+i) , '192.168.%d.3/24' % (11+i),
        '192.168.%d.4/24' % (11+i), '192.168.%d.5/24' % (11+i)) for i in
         range(4)]
 b2b_cl = [('10.10.1.1/24', '10.10.1.2/24')]
+addr_map = {
+        'n01': {'ens1f0': '192.168.11.151/24', 'ens1f1': '192.168.11.152/24'},
+        'n02': {'enp6s0f0': '192.168.11.153/24', 'enp6s0f1': '192.168.11.154/24',
+            'enp4s0f4np0':'192.168.11.163/24', 'enp4s0f6np0': '192.168.11.162'},
+        'n04': {'enp1s0f0': '192.168.11.161/24'},
+        'n05': {'enp1s0f0': '192.168.11.162/24'},
+        }
+n01 = {'ens1f0': '192.168.11.151/24', 'ens1f1': '192.168.11.152/24'}
 star = [('192.168.20.%d/24'%i) for i in range(2, 10)]
 def_ports = [50000, 60000]
 
@@ -31,10 +39,7 @@ def linux_defaults(env):
     env.nm_premod = ['mdio']
     env.linux_config = 'def'
     env.ovs_src = os.path.join(env.workdir, 'ovs')
-    env.priv_if_num = 16
-    env.priv_ring_num = 32
-    env.priv_buf_num = 32784
-    env.priv_ring_size = 18432 # what's this?
+
 
     # May fail, set warn_only
     env.nic_all_profiles = {
@@ -63,9 +68,8 @@ def linux_defaults(env):
             'ethtool -L {} combined {}',
         ],
         'noim': [
+            'ethtool -C {} adaptive-rx off adaptive-tx off', # i40e
             'ethtool -C {} rx-usecs 0 tx-usecs 0',
-            'ethtool -C {} adaptive-rx off adaptive-tx '
-            'off rx-usecs 0 tx-usecs 0'
         ],
         'busywait': [
             'ethtool -C {} rx-usecs 1022',
@@ -95,18 +99,17 @@ def freebsd_defaults(env):
             'sysctl dev.{}.rx_itr=1',
         ],
     }
-    # Merge with linux_defaults() better...
-    env.priv_if_num = 16
-    env.priv_ring_num = 32
-    env.priv_buf_num = 32784
-    env.priv_ring_size = 18432 # what's this?
-    #env.priv_ring_size = 33024  # accommodate 2048 slots
-
     env.nooldkern = False
 
 def hostenv(env):
 
     name = env.original_host
+
+    env.priv_if_num = env.ncpus * 2
+    env.priv_ring_size = 33024 # accommodate 2048 slots
+    env.priv_ring_num = env.ncpus * 2 * 2
+    # 10k extra buffers per core
+    env.priv_buf_num = env.priv_ring_num * 2048 + env.ncpus * 10000
 
     if name == 'vm0':
         env.nogit=True
@@ -200,13 +203,6 @@ def hostenv(env):
         env.nic_profiles = ['common', 'onload', 'csum']
         #env.nic_profiles = ['common', 'onload']
         env.no_clflush = True;
-        #env.priv_ring_num = 16
-        #env.priv_buf_num = 32000
-        #env.priv_ring_size = 33024  # accommodate 2048 slots
-        env.priv_if_num = 4
-        env.priv_ring_num = 32
-        env.priv_buf_num = 16000
-        env.priv_ring_size = 33024  # accommodate 2048 slots
 
     elif name == 'va2' or name == 'va3':
         linux_defaults(env)
@@ -220,10 +216,6 @@ def hostenv(env):
         env.nm_no_ext_drivers = env.nm_modules
         env.nic_profiles = ['common', 'onload', 'csum']
         env.no_clflush = True;
-        env.priv_if_num = 8
-        env.priv_ring_num = 32
-        env.priv_buf_num = 160000
-        env.priv_ring_size = 33024  # accommodate 2048 slots
 
     elif name == 'o02':
         linux_defaults(env)
@@ -231,32 +223,23 @@ def hostenv(env):
         env.nm_modules = ['ixgbe']
         env.nm_no_ext_drivers = env.nm_modules
         env.nic_profiles = ['common', 'onload', 'csum', 'noim', 'mq']
-        env.priv_if_num = 32
-        env.priv_ring_num = 128
-        env.priv_buf_num = env.priv_ring_num*2048*10
-        env.priv_ring_size = 33024  # accommodate 2048 slots
 
-    elif name == 'dummy':# or name == 'n05':# or name == 'n04':
-        if name == 'n05' or name == 'n04':
-            env.ifs = ['ixl0']
-        else:
-            env.ifs = ['ix0']
-        if name == 'n05' or name == 'n07':
-            env.ifs_addr = {env.ifs[0]:b2b[0][1]}
-        else:
-            env.ifs_addr = {env.ifs[0]:b2b[0][0]}
-        freebsd_defaults(env)
-        env.fbsd_config = 'GENERIC'
-        env.nic_profiles = ['common', 'onload']
-        env.priv_if_num = 8
-        env.priv_ring_num = 64
-        env.priv_buf_num = env.priv_ring_num*2048*4
-        env.priv_ring_size = 33024  # accommodate 2048 slots
-
+#    elif name == 'n04':# or name == 'n05':# or name == 'n04':
+#        if name == 'n05' or name == 'n04':
+#            env.ifs = ['ixl0']
+#        else:
+#            env.ifs = ['ix0']
+#        if name == 'n05' or name == 'n07':
+#            env.ifs_addr = {env.ifs[0]:b2b[0][3]}
+#        else:
+#            env.ifs_addr = {env.ifs[0]:b2b[0][2]}
+#        freebsd_defaults(env)
+#        env.fbsd_config = 'GENERIC'
+#        env.nic_profiles = ['common', 'onload']
+#
     elif name == 'n01' or name == 'n02' or name == 'n04' or name == 'n05' or name == 'n06' or name == 'n07':
         linux_defaults(env)
-        #env.nrings = env.ncpus
-        env.nrings = 1
+        env.nrings = env.ncpus
         env.linux_config = 'cur'
         if name == 'n01':
             env.ifs = ['ens1f0', 'ens1f1']
@@ -265,14 +248,8 @@ def hostenv(env):
         elif name in ['n04', 'n05', 'n06', 'n07']:
             env.ifs = ['enp1s0f0']
 
-        if name == 'n01' or name == 'n06':
-            env.ifs_addr = {env.ifs[0]: b2b[0][0]}
-        elif name == 'n02' or name == 'n07':
-            env.ifs_addr = {env.ifs[0]: b2b[0][1]}
-        elif name == 'n04':
-            env.ifs_addr = {env.ifs[0]: b2b[0][2]}
-        elif name == 'n05':
-            env.ifs_addr = {env.ifs[0]: b2b[0][3]}
+        if name in addr_map:
+            env.ifs_addr = addr_map[name]
 
         #env.nm_modules = ['ixgbe', 'i40e']
         if name == 'n06' or name == 'n07':
@@ -281,25 +258,10 @@ def hostenv(env):
             env.nm_modules = ['i40e']
         env.nm_no_ext_drivers = env.nm_modules
         if name == 'n01' or name == 'n04' or name == 'n06':
-            env.nic_profiles = ['common', 'onload', 'csum', 'noim', 'mq']
+            env.nic_profiles = ['common', 'singleq', 'onload', 'csum', 'noim']
         else:
-            env.nic_profiles = ['common', 'offload', 'csum', 'noim', 'mq']
-        if name == 'n01':
-            env.priv_if_num = 8
-            env.priv_ring_num = 64
-            env.priv_buf_num = env.priv_ring_num*2048*100
-            env.priv_ring_size = 33024  # accommodate 2048 slots
-        if name == 'n04' or name == 'n06' or name == 'n07' or name == 'n05':
-            env.priv_if_num = 8
-            env.priv_ring_num = 64
-            #env.priv_buf_num = env.priv_ring_num*2048*10
-            env.priv_buf_num = env.priv_ring_num*2048*4
-            env.priv_ring_size = 33024  # accommodate 2048 slots
-        else:
-            env.priv_if_num = 32
-            env.priv_ring_num = 256
-            env.priv_buf_num = env.priv_ring_num*2048*10
-            env.priv_ring_size = 33024  # accommodate 2048 slots
+            env.nic_profiles = ['common', 'offload', 'csum', 'noim']
+
 
     elif name == 'localhost':
         env.nogit=True
@@ -353,10 +315,6 @@ def hostenv(env):
         #if name != 'cl0' and name != 'cl2':
         #    env.nic_profiles = ['common', 'offload', 'csum', 'mq', 'noim']
         #if name == 'cl0' or name =='cl2':
-        env.priv_if_num = 32
-        env.priv_ring_num = 320
-        env.priv_buf_num = 400000
-        env.priv_ring_size = 33024  # accommodate 2048 slots
 
     else:
         linux_defaults(env)

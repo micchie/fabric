@@ -413,7 +413,7 @@ def make_netmap(c, host, src=None, config=False,
 
 @task
 def make_linux(c, host, src=None, config=False,
-        debug=False, trace=False, opt=False, pmem=False, nospace=False):
+        old=True, debug=False, trace=False, opt=False, pmem=False, nospace=False):
     c = Connection(host)
     _hostenv(c)
     if src:
@@ -421,7 +421,7 @@ def make_linux(c, host, src=None, config=False,
     if config:
         with c.cd(c.linux_src):
             c.run("make mrproper")
-        config_linux(c, debug, trace, opt, (not ('nopmem' in c)))
+        config_linux(c, old, debug, trace, opt, (not ('nopmem' in c)))
     with c.cd(c.linux_src):
         c.run("make -j%d bzImage" % (c.ncpus+1))
         c.run("make -j%d modules" % (c.ncpus+1))
@@ -460,7 +460,7 @@ def update_kconfig(c, d, conffile):
 #
 # config must be def, cur or old
 #
-def config_linux(c, debug, trace, opt, pmem):
+def config_linux(c, old, debug, trace, opt, pmem):
 
     base = c.linux_config
     with c.cd(c.linux_src):
@@ -502,14 +502,17 @@ def config_linux(c, debug, trace, opt, pmem):
     dbg_config = ['UNINLINE_SPIN_UNLOCK', 'PREEMPT_COUNT', 'DEBUG_SPINLOCK',
                       'DEBUG_MUTEXES', 'DEBUG_LOCK_ALLOC', 'DEBUG_LOCKDEP',
                       'LOCKDEP', 'DEBUG_ATOMIC_SLEEP', 'TRACE_IRQFLAGS',
-                      'DETECT_HUNG_TASK', 'WQ_WATCHDOG',
+                      'SLUB_DEBUG', 'DETECT_HUNG_TASK', 'WQ_WATCHDOG',
                       'LOCK_DEBUGGING_SUPPORT', 'DEBUG_RT_MUTEXES',
                       'DEBUG_LIST', 'DEBUG_PLIST', 'DEBUG_NOTIFIERS',
-                      'BUG_ON_DATA_CORRUPTION', 'DEBUG_KOBJECT',
+                      'BUG_ON_DATA_CORRUPTION',
                       'RCU_TORTURE_TEST', 'RCU_REF_SCALE_TEST',
                       'RCU_TRACE', 'RCU_EQS_DEBUG',
                       'DEBUG_WQ_FORCE_RR_CPU', 'DEBUG_BLOCK_EXT_DEVT',
                       'CPU_HOTPLUG_STATE_CONTROL', 'LATENCYTOP',
+                      'DEBUG_MISC', 'LOCKUP_DETECTOR', 'SOFTLOCKUP_DETECTOR',
+                      'HARDLOCKUP_DETECTOR', 'DEBUG_PAGE_REF', 'STACKTRACE',
+                      'FTRACE', 'SAMPLES', 'STRICT_DEVMEM'
                       ]
     if debug:
         d.update({k:'y' for k in dbg_config})
@@ -553,6 +556,9 @@ def config_linux(c, debug, trace, opt, pmem):
     #              'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
     #d.update(tun_config)
 
+    emptyconfigs = {'SYSTEM_TRUSTED_KEYS':'""'}
+    d.update(emptyconfigs)
+
     noconfigs = ['IP_SCTP', 'IP_DCCP', 'MPTCP', 'SWAP', 'SOUND', 'AUDIT',
               'NETLABEL',
               'NET_VENDOR_3COM', 'E100', 'NET_VENDOR_MICROSEMI',
@@ -582,8 +588,7 @@ def config_linux(c, debug, trace, opt, pmem):
               'NET_VENDOR_RENESAS', 'NET_VENDOR_QLOGIC', 'MACINTOSH_DRIVERS',
               'NET_VENDOR_ALACRITECH', 'NET_CADENCE',
               'NET_VENDOR_EZCHIP', 'WLAN', 'PPS', 'LEDS_TRIGGERS',
-              'EEPC_LAPTOP', 'SYSTEM_TRUSTED_KEYRING', 'SYSTEM_TRUSTED_KEYS',
-              'STAGING', 'DRM_XEN', 'SLIP', 'VMXNET3',
+              'EEPC_LAPTOP', 'STAGING', 'DRM_XEN', 'SLIP', 'VMXNET3',
               'NET_VENDOR_CHELSIO', 'NET_VENDOR_AQUANTIA',
               'CAN', 'WAN', 'SCSI_QLOGIC_1280', 'SCSI_QLA_FC', 'SCSI_QLA2XXX',
               'SCSI_QLA_ISCSI', 'SCSI_LPFC', 'SCSI_BFA_FC', 'ATM', 'ISDN',
