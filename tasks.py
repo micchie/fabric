@@ -34,6 +34,7 @@ import re
 import os
 import time
 from patchwork.transfers import rsync
+from pathlib import Path
 
 def is_freebsd(c):
     return c.ostype == 'FreeBSD'
@@ -94,18 +95,6 @@ def rsynctest(c, host, src, dst):
     if ssh_agent:
         c.config['run']['env']['SSH_AUTH_SOCK'] = ssh_agent
     rsync(c, src, dst, ssh_opts=get_ssh_opts(c))
-
-@task
-def test(c, host):
-    c = Connection(host)
-    print('c', c)
-    c.run('ls')
-
-@task
-def test2(c, host):
-    c = Connection(host)
-    _hostenv(c)
-    c.sudo('bash -c "cd deployed && ls"')
 
 def _exists(c, s):
     if is_freebsd(c):
@@ -174,8 +163,8 @@ def _setup_ifs(c, host=None, ifs=None, profiles=[]):
             for cmd in cmdlist:
                 do_ifcmd(c, cmd, i)
     # set irq properly if possible
-    if is_linux(c):
-        setup_irq(c, host)
+    #if is_linux(c):
+    #    setup_irq(c, host)
 
     # configure IP addresses
     for i in ifs:
@@ -188,11 +177,19 @@ def _setup_ifs(c, host=None, ifs=None, profiles=[]):
                 c.sudo('ifconfig %s inet %s' % (i, c.ifs_addr[i]), warn=True,
                         echo=True)
 
-def _enable_netmap_debug(c):
+def _netmap_debug(c, en):
     f = os.path.join(c.netmap_src, 'sys/dev/netmap/netmap_kern.h')
     s = '#define CONFIG_NETMAP_DEBUG 1'
-    if not files.contains(c, f, s):
-        c.run("sed -i '1s/^/{}\\n/' {}".format(s, f))
+    if en and not files.contains(c, f, s):
+        if is_freebsd(c):
+            c.run("sed -i '' '1s/^/{}\\n/' {}".format(s, f))
+        else:
+            c.run("sed -i '1s/^/{}\\n/' {}".format(s, f))
+    elif not en and files.contains(c, f, s):
+        if is_freebsd(c):
+            c.run("sed -zi '' '1s/{}\n//' {}".format(s, f))
+        else:
+            c.run("sed -zi '1s/{}\n//' {}".format(s, f))
 
 @task
 def unload_netmap(c):
@@ -214,6 +211,8 @@ def unload_netmap(c):
     print('unload_netmap: netmap_modules ', netmap_modules)
 
     for m in netmap_modules:
+        if m == 'i40e':
+            c.sudo('rmmod i40iw', warn=True)
         c.sudo('rmmod ' + m, warn=True)
         r = c.sudo('modprobe -r ' + m, warn=True)
         if r.exited != 0:
@@ -229,8 +228,8 @@ def _load_netmap(c, host=None, debug=False):
             c.sudo('sysctl -w dev.netmap.priv_%s=%d'%(k, v))
         _setup_ifs(c, c.ifs, profiles=c.nic_profiles)
         if debug:
-            verbose = 1
-            debug = 65536
+            verbose = 16384 # NM_DEBUG_MEM
+            debug = 131071
         else:
             verbose = 0
             debug = 0
@@ -248,7 +247,16 @@ def _load_netmap(c, host=None, debug=False):
     for m in c.nm_modules:
         if re.search('\.c', m):
             m = m.strip('\.c')
-        if c.run('lsmod | grep ^' + m, warn=True, hide='both').exited == 0:
+
+        # remove depending modules
+        lsmod = c.run('lsmod | grep ^' + m, warn=True, hide='both')
+        res = re.split('\s+', lsmod.stdout)[:-1]
+        if len(res) > 3:
+            dep_modules = res[-1].split(',')
+            for dep in dep_modules:
+                c.sudo('rmmod ' + dep, warn=True)
+
+        if lsmod.exited == 0:
             c.sudo('rmmod ' + m, warn=True) # XXX e1000e against e1000
             #sudo('modprobe -r ' + m, warn_only=True) # XXX e1000e against e1000
             c.sudo('lsmod')
@@ -281,7 +289,7 @@ def _load_netmap(c, host=None, debug=False):
         c.sudo('bash -c "echo 16384 >> /sys/module/netmap/parameters/verbose"',
             echo=True)
         c.sudo('bash -c "echo 65536 >> /sys/module/netmap/parameters/debug"',
-            echo=True)
+            echo=True, warn=True)
         c.sudo('bash -c "echo 7 >> /proc/sys/kernel/printk"')
     #sudo('echo %d > /sys/module/netmap/parameters/debug'%65536)
     _setup_ifs(c, c.ifs, profiles=c.nic_profiles)
@@ -351,11 +359,19 @@ def _make_netmap_apps(c, host=None, src=None, lib=False):
         with c.cd(os.path.join(c.netmap_src, 'libnetmap')):
             c.run('{} clean'.format(makecmd))
             c.run(makecmd)
+    return
     phttpd = os.path.join(appdir, 'phttpd')
     print('phttpd', phttpd, _exists(c, phttpd))
     if _exists(c, phttpd):
         with c.cd(phttpd):
             c.run('{} clean; {}'.format(makecmd, makecmd))
+@task
+def make_homa(c, host, src):
+    c = ensure_connected(c, host)
+    dst = Path(c.workdir)/Path(src.split('/')[-1])
+    rsync_upload(c, src, dst, nogit=c.nogit, delete=True)
+    with c.cd(dst):
+        c.run('make')
 
 @task
 def make_netmap(c, host, src=None, config=False,
@@ -379,8 +395,7 @@ def make_netmap(c, host, src=None, config=False,
     #tweak_netmap(env.netmap_src)
     libnetmappath = os.path.join(c.netmap_src, 'libnetmap')
     if is_linux(c):
-        if debug:
-            _enable_netmap_debug(c)
+        _netmap_debug(c, debug)
         _make_netmap_linux(c, c.netmap_src, config, apps, drivupload)
         if _exists(c, libnetmappath):
             with c.cd(libnetmappath):
@@ -392,23 +407,18 @@ def make_netmap(c, host, src=None, config=False,
             _load_netmap(c, debug=debug)
 
     elif is_freebsd(c):
-        with c.cd(env.netmap_src):
+        with c.cd(c.netmap_src):
             print('copying files')
-            #run('cp sys/dev/netmap/netmap* sys/dev/netmap/stackmap.c sys/dev/netmap/ptnetmap.c ' + os.path.join(env.fbsd_src,
-            run('cp sys/dev/netmap/netmap* ' + os.path.join(env.fbsd_src,
+            _netmap_debug(c, debug)
+            c.run('cp sys/dev/netmap/netmap* ' + os.path.join(c.fbsd_src,
             'sys/dev/netmap/'))
-            s = 'sys/dev/netmap/netmap_stack.c'
-            if _exists(os.path.join(env.netmap_src, s)):
-                run('cp %s '%s + os.path.join(env.fbsd_src,
-                        'sys/dev/netmap/'))
-            run('cp sys/net/netmap* ' + os.path.join(env.fbsd_src, 'sys/net/'))
-        make_freebsd(None, upload=False, config=config, world=False)
-        with cd(env.netmap_src):
-            if _exists(libnetmappath):
-                with cd(libnetmappath):
-                    run('clang -c nmreq.c -I../sys -DLIB')
-                    run('ar rcs libnetmap.a nmreq.o')
-        _make_netmap_apps()
+            c.run('cp sys/net/netmap* ' + os.path.join(c.fbsd_src, 'sys/net/'))
+        _make_freebsd(c, config=config, debug=debug)
+        with c.cd(c.netmap_src):
+            if _exists(c, libnetmappath):
+                with c.cd(libnetmappath):
+                    c.run('gmake')
+        _make_netmap_apps(c, host=host)
     print('done make_netmap')
 
 @task
@@ -419,9 +429,9 @@ def make_linux(c, host, src=None, config=False,
     if src:
         rsync_upload(c, src, c.linux_src, nogit=c.nogit, delete=(not not config))
     if config:
-        with c.cd(c.linux_src):
-            c.run("make mrproper")
-        config_linux(c, old, debug, trace, opt, (not ('nopmem' in c)))
+        #with c.cd(c.linux_src):
+        #    c.run("make mrproper")
+        config_linux(c, old, debug, trace, opt, (not ('nopmem' in c)), nozstd=c.nozstd)
     with c.cd(c.linux_src):
         c.run("make -j%d bzImage" % (c.ncpus+1))
         c.run("make -j%d modules" % (c.ncpus+1))
@@ -457,63 +467,97 @@ def update_kconfig(c, d, conffile):
             if v != 'n':
                 open(conffile, 'a').write(kk + '=' + v + '\n')
 
-#
-# config must be def, cur or old
-#
-def config_linux(c, old, debug, trace, opt, pmem):
+def config_linux(c, old, debug, trace, opt, pmem, nozstd=False):
 
-    base = c.linux_config
     with c.cd(c.linux_src):
-        if base == 'cur':
+        if old and not _exists(c, '.config'):
             c.run('cp /boot/config-`uname -r` .config')
-            c.run('yes "" | make olddefconfig')
-        elif base == 'def':
-            c.run("make defconfig")
-
-    #ver = kernelversion()
-    if opt:
-        if debug:
-            print('debug cannot coexist with opt')
-            debug = False
-    #    if trace:
-    #        print('trace cannot coexist with opt')
-    #        trace = False
-
-    d = {}
-
+        c.run('yes "" | make olddefconfig')
     # Let's add LOCALVERSION for pxeboot which doesn't boot with short name
-    d.update({'LOCALVERSION':'"-fab"'})
+    d = {'LOCALVERSION':'"-fab"'}
+    print('nozstd ', nozstd)
 
-    # y for systemtap, otherwise n
-    if trace:
-        #trace_config = ['RELAY', 'DEBUG_FS', 'DEBUG_INFO', 'KPROBES',
-        #                'KPROBE_EVENTS',
-        #                'DEBUG_INFO_DWARF4', 'ENABLE_MUST_CHECK',
-        #                'FRAME_POINTER', 'DEBUG_KERNEL', 'KALLSYMS_ALL',
-        #                'BPF_SYSCALL', 'BPF_EVENTS', 'BPF_JIT_ALWAYS_ON']
-        #d.update({k:'y' for k in trace_config})
-        # followings are not enabled in Ubuntu focal by default
-        trace_non_default_config = {'ENABLE_MUST_CHECK':'y',
-                'KALLSYMS_ALL':'y',
-                'DEBUG_INFO_REDUCED':'n'}
-        d.update({k:'y' for k in trace_non_default_config})
+    noconfigs = ['PPP', 'IP_DCCP', 'MPTCP', 'SWAP', 'SOUND', 'AUDIT',
+              'NETLABEL', 'NET_VENDOR_3COM', 'E100', 'NET_VENDOR_MICROSEMI',
+              'NET_VENDOR_MICROCHIP', 'NET_VENDOR_MYRI', 'NET_VENDOR_NETERION',
+              'NET_VENDOR_ADAPTEC', 'NET_VENDOR_AGERE', 'NET_VENDOR_ALTEON',
+              'ALTERA_TSE', 'NET_VENDOR_AMD', 'NET_XGENE', 'EDAC', 'SECURITY',
+              'NET_VENDOR_ARC', 'NET_VENDOR_ATHEROS', 'NET_VENDOR_CISCO',
+              'NET_VENDOR_DEC', 'DNET', 'CX_ECAT', 'NET_VENDOR_DLINK',
+              'NET_VENDOR_FUJITSU', 'NET_VENDOR_MICREL', 'NET_VENDOR_NATSEMI',
+              'NET_VENDOR_NVIDIA', 'NET_VENDOR_OKI', 'NET_VENDOR_QUALCOMM',
+              'NET_VENDOR_RDC', 'NET_VENDOR_SAMSUNG', 'NET_VENDOR_SEEQ',
+              'NET_VENDOR_SILAN', 'NET_VENDOR_SIS', 'NET_VENDOR_SMSC',
+              'NET_VENDOR_STMICRO', 'NET_VENDOR_SUN', 'NET_VENDOR_TEHUTI',
+              'NET_VENDOR_TI', 'NET_VENDOR_VIA', 'NET_VENDOR_WIZNET',
+              'NET_VENDOR_XIRCOM', 'FDDI', 'HIPPI', 'NET_SB1000',
+              'USB_PRINTER', 'INPUT_TOUCHSCREEN', 'INPUT_TABLET',
+              'INPUT_JOYSTICK', 'USB_NET_DRIVERS', 'WIRELESS',
+              'NET_VENDOR_EMULEX', 'NET_VENDOR_EXAR', 'NET_VENDOR_BROCADE',
+              'NET_VENDOR_HP', 'NET_VENDOR_I825XX', 'NET_VENDOR_MARVELL',
+              'HAMRADIO', 'NET_VENDOR_MYRI', 'RFKILL', 'TASK_XACCT', 'PCCARD',
+              'PCMCIA', 'PCMCIA_LOAD_CIS', 'CARDBUS', 'IRDA', 'DONGLE', 
+              'WIMAX', 'RFKILL', 'CAIF', 'NFC', 'MEDIA_SUPPORT', 'RC_CORE',
+              'USB_VIDEO_CLASS', 'USB_VIDEO_CLASS_INPUT_EVDEV', 'USB_GSPCA',
+              'DVB_USB', 'VIDEO_EM28XX', 'USB_AIRSPY', 'USB_HACKRF',
+              'USB_MSI2500', 'MEDIA_PCI_SUPPORT', 'VIDEO_MEYE', 'VIDEO_SOLO6X10',
+              'VIDEO_TW68', 'VIDEO_ZORAN', 'VIDEO_IVTV',
+              'NET_VENDOR_RENESAS', 'NET_VENDOR_QLOGIC', 'MACINTOSH_DRIVERS',
+              'NET_VENDOR_ALACRITECH', 'NET_CADENCE',
+              'NET_VENDOR_EZCHIP', 'WLAN', 'PPS', 'LEDS_TRIGGERS',
+              'EEPC_LAPTOP', 'STAGING', 'DRM_XEN', 'SLIP', 'VMXNET3',
+              'NET_VENDOR_CHELSIO', 'NET_VENDOR_AQUANTIA', 'FUJITSU_ES',
+              'CAN', 'WAN', 'SCSI_QLOGIC_1280', 'SCSI_QLA_FC', 'SCSI_QLA2XXX',
+              'SCSI_QLA_ISCSI', 'SCSI_LPFC', 'SCSI_BFA_FC', 'ATM', 'ISDN',
+              'IIO', 'USB_GADGET', '6LOWPAN', 'BT', 'BATMAN_ADV', 'TIPC',
+              'DECNET', 'PHONET', 'NET_NCSI', 'ATALK', 'AFS_FS', 'CIFS',
+              'CEPH_FS', 'CEPH_LIB', 'F2FS_FS', 'REISERFS_FS', 'GFS2_FS',
+              'OCFS2_FS', 'BLK_DEV_DRBD', 'FUSION', 'TARGET', 'FIREWIRE',
+              'MACINTOSH_DRIVERS', 'NET_FC', 'YENTA', 'RAPIDIO',
+              'SENSORS_LIS3LV02D', 'AD525X_DPOT', 'IBM_ASM', 'PHANTOM',
+              'TIFM_CORE', 'ICS932S401', 'ENCLOSURE_SERVICES', 'SGI_XP',
+              'APDS9802ALS', 'ISL29003', 'ISL29020', 'SENSORS_TSL2550',
+              'SENSORS_BH1770', 'SENSORS_APDS990X', 'HMC6352', 'DS1682',
+              'VMWARE_BALLOON', 'AGP', 'I2C_NVIDIA_GPU', 'VGA_ARB',
+              'TOSHIBA_HAPS', 'TOSHIBA_BT_RFKILL',
+              'MUX_ADG792A', 'MUX_ADGS1408', 'MUX_GPIO', 'VME_BUS', 'VME_CA91CX42',
+              'VME_TSI148', 'VME_FAKE',  'VMIVME_7805', 'VME'
+              'MMC', 'MMC_TOSHIBA_PCI', 'PATA_SERVERWORKS',
+              'PATA_ALI', 'PATA_AMD', 'PATA_ARTOP', 'PATA_ATIIXP',
+              'PATA_ATP867X', 'PATA_CMD64X', 'PATA_EFAR', 'PATA_HPT366',
+              'PATA_HPT37X', 'PATA_IT8213', 'PATA_IT821X', 'PATA_JMICRON',
+              'PATA_MARVELL', 'PATA_MPIIX', 'PATA_NETCELL', 'PATA_NINJA32',
+              'PATA_NS87410', 'PATA_NS87415', 'PATA_OLDPIIX', 'PATA_PDC2027X',
+              'PATA_PDC_OLD', 'PATA_RDC', 'PATA_RZ1000', 'PATA_SAMSUNG_CF',
+              'PATA_SCH', 'PATA_SERVERWORKS', 'PATA_SIL680', 'PATA_SIS',
+              'PATA_TOSHIBA', 'PATA_TRIFLEX', 'PATA_VIA', 'GNSS',
+              'NET_9P', 'EISA', 'JFS_FS', 'PARPORT', 'IEEE802154_DRIVERS',
+              'GAMEPORT', 'MSPRO_BLOCK', 'MS_BLOCK', 'MEMSTICK_TIFM_MS',
+              'MEMSTICK_JMICRON_38X', 'MEMSTICK_R592', 'MEMSTICK_REALTEK_PCI',
+              'MEMSTICK_REALTEK_USB', 'HYPERV', 'ANDROID'
+              , 'PATA_CYPRESS',
+              # 5.9-success
+              'PATA_HPT3X2N', 'PATA_HPT3X3', 'PATA_OPTIDMA', 'PATA_RADISYS',
+              'PATA_SIS', 'PATA_WINBOND', 'PATA_ACPI', 'PATA_LEGACY',
+              'PATA_OPTI',
+              'PATA_CMD640_PCI', 'PATA_PLATFORM', 'PATA_TIMINGS', #'ATA',
+              'ATA_VERBOSE_ERROR', 'ATA_FORCE', #'ATA_ACPI', 'ATA_SFF',
+              'ATA_BMDMA', 'ATA_PIIX',
+              'DCB', 'RETPOLINE', 
+              ]
+    d.update({k:'n' for k in noconfigs})
 
     # General kernel debug (disable if unnecessary)
-    dbg_config = ['UNINLINE_SPIN_UNLOCK', 'PREEMPT_COUNT', 'DEBUG_SPINLOCK',
-                      'DEBUG_MUTEXES', 'DEBUG_LOCK_ALLOC', 'DEBUG_LOCKDEP',
-                      'LOCKDEP', 'DEBUG_ATOMIC_SLEEP', 'TRACE_IRQFLAGS',
-                      'SLUB_DEBUG', 'DETECT_HUNG_TASK', 'WQ_WATCHDOG',
-                      'LOCK_DEBUGGING_SUPPORT', 'DEBUG_RT_MUTEXES',
-                      'DEBUG_LIST', 'DEBUG_PLIST', 'DEBUG_NOTIFIERS',
-                      'BUG_ON_DATA_CORRUPTION',
-                      'RCU_TORTURE_TEST', 'RCU_REF_SCALE_TEST',
-                      'RCU_TRACE', 'RCU_EQS_DEBUG',
-                      'DEBUG_WQ_FORCE_RR_CPU', 'DEBUG_BLOCK_EXT_DEVT',
-                      'CPU_HOTPLUG_STATE_CONTROL', 'LATENCYTOP',
-                      'DEBUG_MISC', 'LOCKUP_DETECTOR', 'SOFTLOCKUP_DETECTOR',
-                      'HARDLOCKUP_DETECTOR', 'DEBUG_PAGE_REF', 'STACKTRACE',
-                      'FTRACE', 'SAMPLES', 'STRICT_DEVMEM'
-                      ]
+    dbg_config = ['LOCK_DEBUGGING_SUPPORT', 'DEBUG_SPINLOCK',
+                  'DEBUG_MUTEXES', 'DEBUG_LOCK_ALLOC', 'DEBUG_LOCKDEP',
+                  'LOCKDEP', 'DEBUG_ATOMIC_SLEEP', 'TRACE_IRQFLAGS',
+                  'SLUB_DEBUG', 'DETECT_HUNG_TASK', 'WQ_WATCHDOG',
+                  'DEBUG_PREEMPT', 'DEBUG_RT_MUTEXES',
+                  'DEBUG_LIST', 'DEBUG_PLIST', 'DEBUG_NOTIFIERS',
+                  'DEBUG_WQ_FORCE_RR_CPU', 'DEBUG_BLOCK_EXT_DEVT',
+                  'DEBUG_MISC', 'DEBUG_PAGE_REF', 'RCU_TRACE', 'RCU_EQS_DEBUG',
+                  'DEBUG_IRQFLAGS'
+                  ]
     if debug:
         d.update({k:'y' for k in dbg_config})
     else:
@@ -535,126 +579,17 @@ def config_linux(c, old, debug, trace, opt, pmem):
     #              'R8169':'m', 'IXGBE_DCA':'y', 'IXGBE_DCB':'n', 'IXGBEVF':'m',
     #              'I40E':'m', 'I40EVF':'m', 'I40E_DCB':'n', 'VETH':'m', 'INFINIBAND':'n'}
     #d.update(nic_config)
-    nodcb_config = {'DCB':'n'}
-    d.update(nodcb_config)
-
-    # mellanox
-    #mlx_config = {'NET_VENDOR_MELLANOX':'y', 'MLX4_EN':'m', 'MLX4_CORE':'m',
-    #              'MLX4_DEBUG':'y', 'MLX4_CORE_GEN2':'y', 'MLX5_CORE':'m',
-    #              'MLX5_CORE_EN':'y', 'MLX5_EN_ARFS':'y', 'MLX5_EN_RXNFC':'y',
-    #              'MLX5_MPFS':'y', 'MLX4_ESWITCH':'y', 'MLX5_CORE_IPOIB':'y',
-    #              'MLX5_SW_STEERING':'y'}
-    #d.update(mlx_config)
 
     # netmap after 4.17
     ax25_config = {'HAMRADIO':'y', 'AX25':'y'}
     d.update(ax25_config)
 
-    #tun_config = {'NET_IPIP':'m', 'NET_L3_MASTER_DEV':'y', 'BPF_JIT':'y',
-    #              'NET_SWITCHDEV':'y', 'NET_IPGRE':'m', 'NET_IPGRE_DEMUX':'m',
-    #              'NET_IPGRE_BROADCAST':'y', 'NET_IP_TUNNEL':'y',
-    #              'VXLAN':'m', 'LIBCRC32C':'y', 'TUN':'m', 'GENEVE':'m'}
-    #d.update(tun_config)
+    if nozstd:
+        xz_config = {'KERNEL_ZSTD':'n', 'KERNEL_XZ':'y'}
+        d.update(xz_config)
 
-    emptyconfigs = {'SYSTEM_TRUSTED_KEYS':'""'}
+    emptyconfigs = {'SYSTEM_TRUSTED_KEYS':'""', 'SYSTEM_REVOCATION_KEYS':'""'}
     d.update(emptyconfigs)
-
-    noconfigs = ['IP_SCTP', 'IP_DCCP', 'MPTCP', 'SWAP', 'SOUND', 'AUDIT',
-              'NETLABEL',
-              'NET_VENDOR_3COM', 'E100', 'NET_VENDOR_MICROSEMI',
-              'NET_VENDOR_MICROCHIP', 'NET_VENDOR_MYRI', 'NET_VENDOR_NETERION',
-              'NET_VENDOR_ADAPTEC', 'NET_VENDOR_AGERE', 'NET_VENDOR_ALTEON',
-              'ALTERA_TSE', 'NET_VENDOR_AMD', 'NET_XGENE', 'EDAC', 'SECURITY',
-              'NET_VENDOR_ARC', 'NET_VENDOR_ATHEROS', 'NET_VENDOR_CISCO',
-              'NET_VENDOR_DEC', 'DNET', 'CX_ECAT', 'NET_VENDOR_DLINK',
-              'NET_VENDOR_FUJITSU', 'NET_VENDOR_MICREL', 'NET_VENDOR_NATSEMI',
-              'NET_VENDOR_NVIDIA', 'NET_VENDOR_OKI', 'NET_VENDOR_QUALCOMM',
-              'NET_VENDOR_RDC', 'NET_VENDOR_SAMSUNG', 'NET_VENDOR_SEEQ',
-              'NET_VENDOR_SILAN', 'NET_VENDOR_SIS', 'NET_VENDOR_SMSC',
-              'NET_VENDOR_STMICRO', 'NET_VENDOR_SUN', 'NET_VENDOR_TEHUTI',
-              'NET_VENDOR_TI', 'NET_VENDOR_VIA', 'NET_VENDOR_WIZNET',
-              'NET_VENDOR_XIRCOM', 'FDDI', 'HIPPI', 'NET_SB1000',
-              'USB_PRINTER', 'INPUT_TOUCHSCREEN', 'INPUT_TABLET',
-              'INPUT_JOYSTICK', 'USB_NET_DRIVERS', 'WIRELESS',
-              'NET_VENDOR_EMULEX', 'NET_VENDOR_EXAR', 'NET_VENDOR_BROCADE',
-              'NET_VENDOR_HP', 'NET_VENDOR_I825XX', 'NET_VENDOR_MARVELL',
-              'HAMRADIO', 'NET_VENDOR_MYRI', 'RFKILL', 'TASK_XACCT', 'PCCARD',
-              'PCMCIA', 'PCMCIA_LOAD_CIS', 'CARDBUS', 'IRDA', 'DONGLE', 'BT',
-              'WIMAX', 'RFKILL', 'CAIF', 'NFC', 'MEDIA_SUPPORT', 'RC_CORE',
-              'USB_VIDEO_CLASS', 'USB_VIDEO_CLASS_INPUT_EVDEV', 'USB_GSPCA',
-              'DVB_USB', 'VIDEO_EM28XX', 'USB_AIRSPY', 'USB_HACKRF',
-              'USB_MSI2500', 'MEDIA_PCI_SUPPORT', 'VIDEO_MEYE', 'VIDEO_SOLO6X10',
-              'VIDEO_TW68', 'VIDEO_ZORAN', 'VIDEO_IVTV',
-              'NET_VENDOR_RENESAS', 'NET_VENDOR_QLOGIC', 'MACINTOSH_DRIVERS',
-              'NET_VENDOR_ALACRITECH', 'NET_CADENCE',
-              'NET_VENDOR_EZCHIP', 'WLAN', 'PPS', 'LEDS_TRIGGERS',
-              'EEPC_LAPTOP', 'STAGING', 'DRM_XEN', 'SLIP', 'VMXNET3',
-              'NET_VENDOR_CHELSIO', 'NET_VENDOR_AQUANTIA',
-              'CAN', 'WAN', 'SCSI_QLOGIC_1280', 'SCSI_QLA_FC', 'SCSI_QLA2XXX',
-              'SCSI_QLA_ISCSI', 'SCSI_LPFC', 'SCSI_BFA_FC', 'ATM', 'ISDN',
-              'IIO', 'USB_GADGET', '6LOWPAN', 'BT', 'BATMAN_ADV', 'TIPC',
-              'DECNET', 'PHONET', 'NET_NCSI', 'ATALK', 'AFS_FS', 'CIFS',
-              'CEPH_FS', 'CEPH_LIB', 'F2FS_FS', 'REISERFS_FS', 'GFS2_FS',
-              'OCFS2_FS', 'BLK_DEV_DRBD', 'FUSION', 'TARGET', 'FIREWIRE',
-              'MACINTOSH_DRIVERS', 'NET_FC', 'YENTA', 'RAPIDIO',
-              'SENSORS_LIS3LV02D', 'AD525X_DPOT', 'IBM_ASM', 'PHANTOM',
-              'TIFM_CORE', 'ICS932S401', 'ENCLOSURE_SERVICES', 'SGI_XP',
-              'APDS9802ALS', 'ISL29003', 'ISL29020', 'SENSORS_TSL2550',
-              'SENSORS_BH1770', 'SENSORS_APDS990X', 'HMC6352', 'DS1682',
-              'VMWARE_BALLOON', 'AGP', 'I2C_NVIDIA_GPU', 'VGA_ARB',
-              'TOSHIBA_HAPS', 'TOSHIBA_BT_RFKILL',
-              'MMC_TOSHIBA_PCI', 'PATA_SERVERWORKS',
-              'PATA_ALI', 'PATA_AMD', 'PATA_ARTOP', 'PATA_ATIIXP',
-              'PATA_ATP867X', 'PATA_CMD64X', 'PATA_EFAR', 'PATA_HPT366',
-              'PATA_HPT37X', 'PATA_IT8213', 'PATA_IT821X', 'PATA_JMICRON',
-              'PATA_MARVELL', 'PATA_MPIIX', 'PATA_NETCELL', 'PATA_NINJA32',
-              'PATA_NS87410', 'PATA_NS87415', 'PATA_OLDPIIX', 'PATA_PDC2027X',
-              'PATA_PDC_OLD', 'PATA_RDC', 'PATA_RZ1000', 'PATA_SAMSUNG_CF',
-              'PATA_SCH', 'PATA_SERVERWORKS', 'PATA_SIL680', 'PATA_SIS',
-              'PATA_TOSHIBA', 'PATA_TRIFLEX', 'PATA_VIA', 'GNSS' 'MMC',
-              'NET_9P', 'EISA', 'JFS_FS', 'PARPORT', 'IEEE802154_DRIVERS',
-              'GAMEPORT', 'MSPRO_BLOCK', 'MS_BLOCK', 'MEMSTICK_TIFM_MS',
-              'MEMSTICK_JMICRON_38X', 'MEMSTICK_R592', 'MEMSTICK_REALTEK_PCI',
-              'MEMSTICK_REALTEK_USB', 'HYPERV', 'ANDROID'
-              , 'PATA_CYPRESS',
-              # 5.9-success
-              'PATA_HPT3X2N', 'PATA_HPT3X3', 'PATA_OPTIDMA', 'PATA_RADISYS',
-              'PATA_SIS', 'PATA_WINBOND', 'PATA_ACPI', 'PATA_LEGACY',
-              'PATA_OPTI',
-              'PATA_CMD640_PCI', 'PATA_PLATFORM', 'PATA_TIMINGS', #'ATA',
-              'ATA_VERBOSE_ERROR', 'ATA_FORCE', #'ATA_ACPI', 'ATA_SFF',
-              'ATA_BMDMA', 'ATA_PIIX'
-              ]
-    d.update({k:'n' for k in noconfigs})
-
-    """
-    d.update({'IOMMU_SUPPORT':'n'})
-    """
-
-    # Following PMEM/NVMe options seem unnecessary
-    # pmem
-    #nvm_config = {'EXPERT':'y', 'XFS_FS':'y', 'FS_DAX':'y',
-    #        'X86_PMEM_LEGACY_DEVICE':'y', 'X86_PMEM_LEGACY':'y',
-    #        'ACPI_NFIT':'m', 'LIBNVDIMM':'y', 'BLK_DEV_PMEM':'m', 'ND_BLK':'m',
-    #        'ND_CLAIM':'y', 'ND_BTT':'m', 'BTT':'y', 'ND_PFN':'m',
-    #        'NVDIMM_PFN':'y', 'ZONE_DMA':'n', 'MEMORY_HOTPLUG':'y',
-    #        'MEMORY_HOTREMOVE':'y', 'SPARSEMEM_VMEMMAP':'y', 'ZONE_DEVICE':'y',
-    #        'TRANSPARENT_HUGEPAGE':'y', 'DEV_DAX':'y'}
-    #if pmem:
-    #    d.update(nvm_config)
-
-    # NVMe
-    #nvme_config = ['NVME_CORE', 'BLK_DEV_NVME', 'NVME_MULTIPATH']
-    #d.update({k:'y' for k in nvme_config})
-    #nvme_config = ['NVME_FABRICS', 'NVME_RDMA', 'NVME_TCP', 'NVME_TARGEt',
-    #               'NVME_TARGET_LOOP', 'NVME_TARGET_RDMA', 'NVME_TARGET_TCP']
-    #d.update({k:'m' for k in nvme_config})
-
-    # Small optimization
-    #opt_config = {'NETFILTER':'n', 'RETPOLINE':'n'}
-    if opt:
-        opt_config = {'NETFILTER':'n', 'RETPOLINE':'n', 'BPFILTER':'n'}
-        d.update(opt_config)
 
     conffile = '.config'
     c.get(os.path.join(c.linux_src, conffile))
@@ -755,6 +690,7 @@ def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agc
             else:
                 #opt += 'agsize=512000000'
                 opt += 'agsize=128000000'
+        opt += ' -m reflink=0'
         #opt = 'agsize=256m,su=256m,sw=1'
         fsize /= 8
         c.sudo('mkfs.{} {} {}'.format(fstype, opt, devopt), echo=True)
@@ -767,24 +703,27 @@ def config_pmem(c, host, fstype='xfs', fname='netmap_mem', fsize=8000000000, agc
     c.sudo('chmod -R 777 ' + mnt, echo=True)
 
 @task
-def make_freebsd(c, host, src=None, config=False):
+def make_freebsd(c, host, src=None, config=False, debug=False):
     c = Connection(host)
     _hostenv(c)
-    _make_freebsd(c, host=host, src=src, config=config)
+    _make_freebsd(c, host=host, src=src, config=config, debug=debug)
 
-def _make_freebsd(c, host=None, src=None, config=False):
+def _make_freebsd(c, host=None, src=None, config=False, debug=False):
     if src:
         rsync_upload(c, src, c.fbsd_src, nogit=c.nogit,
                 delete=(not not config))
     build_args = ''
     if not config:
         build_args += '-DKERNFAST '
+    fbsd_config = 'GENERIC'
+    if not debug:
+        fbsd_config += '-NODEBUG'
     with c.cd(c.fbsd_src):
         c.run('make -j{} buildkernel {} KERNCONF={}'.format(c.ncpus+1,
-            build_args, c.fbsd_config))
+            build_args, fbsd_config))
     # sudo doesn't work with cd...
     c.sudo('bash -c "cd {} && make installkernel KERNCONF={}"'.format(c.fbsd_src,
-        c.fbsd_config))
+        fbsd_config))
 
 @task
 def make_netmap_freebsd(c, host, src=None, config=False):
